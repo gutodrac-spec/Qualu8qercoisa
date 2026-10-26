@@ -1,0 +1,13 @@
+name: Build Windows EXE
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S game -B build -A x64
+      - run: cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NeonCoast-Windows
+          path: build/Release/NeonCoast.exe
