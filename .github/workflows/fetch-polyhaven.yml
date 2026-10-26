@@ -1,0 +1,20 @@
+name: Fetch Poly Haven models
+on:
+  workflow_dispatch:
+  push:
+    paths: [game/tools/fetch_models.py, .github/workflows/fetch-polyhaven.yml]
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python game/tools/fetch_models.py /tmp/polyhaven
+      - name: Push to polyhaven-assets branch
+        run: |
+          cd /tmp/polyhaven
+          git init -q -b polyhaven-assets
+          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
+          git add -A && git commit -qm "Poly Haven CC0 models"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" polyhaven-assets
