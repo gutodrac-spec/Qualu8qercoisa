@@ -6,35 +6,50 @@
 #include <cmath>
 #include <cstdlib>
 #include <utility>
+#include <cstring>
+#include <string>
 
 // =====================================================================================
 // Shaders
 // =====================================================================================
 static const char* LIT_VS = R"(#version 330
-in vec3 vertexPosition; in vec3 vertexNormal;
+in vec3 vertexPosition; in vec3 vertexNormal; in vec4 vertexColor;
 uniform mat4 mvp; uniform mat4 matModel; uniform mat4 matNormal;
-out vec3 fragPos; out vec3 fragNormal;
+out vec3 fragPos; out vec3 fragNormal; out vec4 vcol;
 void main(){
     fragPos = (matModel*vec4(vertexPosition,1.0)).xyz;
     fragNormal = normalize((matNormal*vec4(vertexNormal,0.0)).xyz);
+    vcol = vertexColor;
     gl_Position = mvp*vec4(vertexPosition,1.0);
 })";
 
 static const char* LIT_FS = R"(#version 330
-in vec3 fragPos; in vec3 fragNormal;
+in vec3 fragPos; in vec3 fragNormal; in vec4 vcol;
 uniform vec4 colDiffuse;
 uniform vec3 lightDir, lightColor, ambSky, ambGround, viewPos, fogColor;
 uniform float fogDensity, night, time, emissive, roughness;
-uniform int surface;            // 0 generico, 1 terreno (asfalto/areia/agua), 2 fachada com janelas
+uniform int surface;            // 0 generico, 1 terreno, 2 fachada, 3 calcada, 4 pintura automotiva
 uniform mat4 lightVP; uniform sampler2D shadowMap; uniform int shadowsOn;
 uniform float blockP, roadW, beachX, waterX;
 uniform vec3 headPos, headDir; uniform float headOn;
+uniform sampler2D tAsphD, tAsphN, tPaveD, tPaveN, tSandD, tSandN, tWallD, tWallN;
 out vec4 finalColor;
 
 float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
 float noise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
     return mix(mix(hash(i),hash(i+vec2(1,0)),f.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x), f.y); }
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+vec3 srgb(vec3 c){ return pow(c, vec3(2.2)); }
+// mapeamento planar com normal map no espaco do mundo
+vec3 planarN(sampler2D N, vec2 uv, vec3 T, vec3 B, vec3 n, float k){
+    vec3 m = texture(N, uv).rgb*2.0-1.0; m.xy *= k;
+    return normalize(T*m.x + B*m.y + n*m.z);
+}
+// quebra a repeticao da textura misturando duas escalas
+vec3 detail(sampler2D D, vec2 uv){
+    vec3 a = texture(D, uv).rgb, b = texture(D, uv*0.31+vec2(0.37,0.11)).rgb;
+    return srgb(mix(a, a*b*1.9, 0.35)) * (0.85+0.3*noise(uv*0.37));
+}
 
 float shadow(vec3 n){
     if (shadowsOn==0) return 1.0;
@@ -42,93 +57,140 @@ float shadow(vec3 n){
     if (p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0||p.z>1.0) return 1.0;
     float bias = max(0.0025*(1.0-dot(n,lightDir)), 0.0006);
     vec2 texel = 1.0/vec2(textureSize(shadowMap,0)); float s=0.0;
+    float ang = hash(fragPos.xz*7.0)*6.283;
+    mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
     for(int x=-2;x<=2;x++) for(int y=-2;y<=2;y++)
-        s += (p.z-bias > texture(shadowMap, p.xy+vec2(x,y)*texel).r) ? 0.0 : 1.0;
-    return s/25.0;
+        s += (p.z-bias > texture(shadowMap, p.xy+rot*vec2(x,y)*texel*1.2).r) ? 0.0 : 1.0;
+    float edge = smoothstep(0.0,0.06,min(min(p.x,1.0-p.x),min(p.y,1.0-p.y)));
+    return mix(1.0, s/25.0, edge);
 }
 
 void main(){
     vec3 n = normalize(fragNormal);
-    vec3 albedo = pow(colDiffuse.rgb, vec3(2.2));
+    vec3 albedo = srgb(colDiffuse.rgb) * vcol.rgb;
     vec3 V = normalize(viewPos-fragPos);
-    float rough = roughness, metal = 0.0; vec3 emis = vec3(0.0);
+    float rough = roughness, metal = 0.0, ao = 1.0; vec3 emis = vec3(0.0);
     bool water = false;
+    vec3 Tx = vec3(1,0,0), Tz = vec3(0,0,1), Ty = vec3(0,1,0);
 
-    if (surface==1){
+    if (surface==4){
+        if (vcol.a < 0.5){ albedo = vec3(0.01,0.012,0.016); rough = 0.02; metal = 0.0; }
+        else { rough = 0.18; metal = 0.25; }
+        ao = mix(0.55, 1.0, smoothstep(0.25, 0.75, fragPos.y));
+    } else if (surface==1){
         float x = fragPos.x, z = fragPos.z;
         if (x > waterX){
             water = true;
-            float t = time;
-            vec2 w = fragPos.xz;
-            float dx = cos(w.x*0.35+t*1.3)*0.08 + cos(w.x*1.3+w.y*0.7+t*2.1)*0.04 + (noise(w*0.8+t)-0.5)*0.08;
-            float dz = cos(w.y*0.4+t*1.1)*0.08 + cos(w.y*1.7-w.x*0.5+t*1.7)*0.04 + (noise(w*0.8-t)-0.5)*0.08;
+            float t = time; vec2 w = fragPos.xz;
+            float dx = cos(w.x*0.35+t*1.3)*0.08 + cos(w.x*1.3+w.y*0.7+t*2.1)*0.04 + (noise(w*0.8+t)-0.5)*0.1 + (noise(w*3.0+t*1.7)-0.5)*0.05;
+            float dz = cos(w.y*0.4+t*1.1)*0.08 + cos(w.y*1.7-w.x*0.5+t*1.7)*0.04 + (noise(w*0.8-t)-0.5)*0.1 + (noise(w*3.0-t*1.3)-0.5)*0.05;
             n = normalize(vec3(-dx,1.0,-dz));
-            float shore = clamp((x-waterX)/40.0,0.0,1.0);
-            albedo = mix(vec3(0.05,0.35,0.35), vec3(0.01,0.08,0.15), shore);
-            rough = 0.05;
-            float foam = smoothstep(0.75,1.0, noise(vec2(z*0.2, x*0.5 - t*0.6))) * (1.0-smoothstep(0.0,6.0,x-waterX));
-            albedo = mix(albedo, vec3(0.9), foam);
+            float shore = clamp((x-waterX)/50.0,0.0,1.0);
+            albedo = mix(vec3(0.04,0.42,0.38), vec3(0.005,0.06,0.12), shore);
+            rough = 0.04;
+            float foam = smoothstep(0.7,1.0, noise(vec2(z*0.25, x*0.6 - t*0.7))) * (1.0-smoothstep(0.0,7.0,x-waterX));
+            albedo = mix(albedo, vec3(0.85), foam); rough = mix(rough, 0.8, foam);
         } else if (x > beachX){
-            float wet = smoothstep(waterX-8.0, waterX, x);
-            albedo = mix(vec3(0.85,0.72,0.5), vec3(0.45,0.36,0.25), wet) * (0.9+0.2*noise(fragPos.xz*3.0));
-            rough = mix(0.95, 0.3, wet);
+            vec2 uv = fragPos.xz*0.25;
+            float wet = smoothstep(waterX-10.0, waterX, x);
+            albedo = detail(tSandD, uv) * mix(1.0, 0.45, wet);
+            n = planarN(tSandN, uv, Tx, Tz, n, 1.0);
+            rough = mix(0.95, 0.25, wet);
         } else {
-            float g = noise(fragPos.xz*2.0)*0.5+noise(fragPos.xz*9.0)*0.5;
-            albedo = vec3(0.06,0.065,0.07)*(0.8+0.4*g);
-            rough = 0.7 - 0.25*noise(fragPos.xz*0.15);
+            vec2 uv = fragPos.xz*0.18;
+            albedo = detail(tAsphD, uv) * 0.8;
+            n = planarN(tAsphN, uv, Tx, Tz, n, 0.8);
+            rough = 0.75 - 0.35*smoothstep(0.55,0.8,noise(fragPos.xz*0.08)); // pocas / partes gastas
             float ax = abs(mod(x, blockP)-blockP*0.5), az = abs(mod(z, blockP)-blockP*0.5);
             bool roadX = az < roadW*0.5, roadZ = ax < roadW*0.5;
-            if (roadZ && !roadX && ax<0.12 && fract(z/6.0)<0.55) albedo = vec3(0.6,0.45,0.05);
-            if (roadX && !roadZ && az<0.12 && fract(x/6.0)<0.55) albedo = vec3(0.6,0.45,0.05);
-            if (roadZ && !roadX && abs(ax-roadW*0.5+0.6)<0.08) albedo = vec3(0.55);
-            if (roadX && !roadZ && abs(az-roadW*0.5+0.6)<0.08) albedo = vec3(0.55);
-            if (roadX && roadZ && (fract((x+z)*0.5)<0.5) && (ax>roadW*0.35 || az>roadW*0.35)) albedo = vec3(0.5);
+            float wear = 0.6 + 0.4*noise(fragPos.xz*1.7);
+            vec3 yel = vec3(0.55,0.38,0.03)*wear, wht = vec3(0.6)*wear;
+            float m = 0.0; vec3 mc = wht;
+            if (roadZ && !roadX && ax<0.12 && fract(z/6.0)<0.55) { m = 1.0; mc = yel; }
+            if (roadX && !roadZ && az<0.12 && fract(x/6.0)<0.55) { m = 1.0; mc = yel; }
+            if (roadZ && !roadX && abs(ax-roadW*0.5+0.6)<0.08) m = 1.0;
+            if (roadX && !roadZ && abs(az-roadW*0.5+0.6)<0.08) m = 1.0;
+            if (roadX && roadZ && (fract((x+z)*0.5)<0.5) && (ax>roadW*0.35 || az>roadW*0.35)) m = 1.0;
+            albedo = mix(albedo, mc, m); rough = mix(rough, 0.6, m);
+            // oclusao junto ao meio-fio
+            float curb = min(roadZ ? roadW*0.5-ax : 99.0, roadX ? roadW*0.5-az : 99.0);
+            if (!(roadX && roadZ)) ao *= mix(0.55, 1.0, smoothstep(0.0, 0.8, curb));
         }
+    } else if (surface==3){
+        if (abs(n.y) > 0.5){
+            vec2 uv = fragPos.xz*0.3;
+            albedo = detail(tPaveD, uv);
+            n = planarN(tPaveN, uv, Tx, Tz, n, 1.0);
+        } else albedo *= 0.8;
+        rough = 0.85;
     } else if (surface==2 && abs(n.y)<0.5){
-        float u = abs(n.x)>abs(n.z) ? fragPos.z : fragPos.x;
+        bool fx = abs(n.x)>abs(n.z);
+        float u = fx ? fragPos.z : fragPos.x;
+        vec2 wuv = vec2(u, fragPos.y)*0.25;
+        vec3 wall = detail(tWallD, wuv);
+        vec3 baseN = n;
+        n = planarN(tWallN, wuv, fx ? Tz : Tx, Ty, n, 1.0);
+        albedo *= wall*1.6;
         vec2 cell = floor(vec2(u/3.0, fragPos.y/3.6));
         vec2 f = fract(vec2(u/3.0, fragPos.y/3.6));
         float win = step(0.18,f.x)*step(f.x,0.82)*step(0.22,f.y)*step(f.y,0.85)*step(3.0,fragPos.y);
+        float frame = (step(0.14,f.x)*step(f.x,0.86)*step(0.18,f.y)*step(f.y,0.89)) - win;
         float r = hash(cell + floor(fragPos.xz/7.0)*13.1);
-        albedo = mix(albedo, vec3(0.03,0.05,0.08), win);
-        rough = mix(rough, 0.08, win); metal = win*0.6;
-        emis += win * step(0.55, r) * night * mix(vec3(1.0,0.7,0.35), vec3(0.7,0.85,1.0), step(0.85,r)) * 1.6;
-        albedo *= 0.92 + 0.08*noise(fragPos.xy*0.5 + fragPos.zy*0.5);
+        albedo = mix(albedo, vec3(0.6), frame*0.8);
+        // vidro: reflete o ceu, cortinas aleatorias
+        vec3 glass = mix(vec3(0.02,0.03,0.04), vec3(0.25,0.22,0.18), step(0.7, hash(cell*3.7))*0.5);
+        albedo = mix(albedo, glass, win);
+        if (win > 0.5) n = baseN;
+        rough = mix(rough, 0.03, win); metal = win*0.2;
+        ao *= mix(1.0, 0.75, frame) * mix(0.7, 1.0, smoothstep(0.0, 4.0, fragPos.y));
+        float interior = step(0.5, r) * (0.6+0.4*hash(cell+1.7));
+        emis += win * interior * night * mix(vec3(1.0,0.68,0.32), vec3(0.75,0.85,1.0), step(0.85,r)) * 1.8;
     }
 
     vec3 L = normalize(lightDir), H = normalize(L+V);
     float NdL = max(dot(n,L),0.0);
     float sh = shadow(normalize(fragNormal));
-    float spec = pow(max(dot(n,H),0.0), mix(512.0,8.0,rough)) * (1.0-rough) * 2.0;
+    float a = max(rough*rough, 0.002), NdH = max(dot(n,H),0.0);
+    float D = a*a / (3.14159 * pow(NdH*NdH*(a*a-1.0)+1.0, 2.0));         // GGX
+    float NdV = max(dot(n,V),0.001);
+    float k = (rough+1.0)*(rough+1.0)/8.0;
+    float G = (NdV/(NdV*(1.0-k)+k)) * (NdL/(NdL*(1.0-k)+k));
     vec3 F0 = mix(vec3(0.04), albedo, metal);
-    float fres = pow(1.0-max(dot(n,V),0.0), 5.0);
-    vec3 F = F0 + (1.0-F0)*fres;
+    vec3 F = F0 + (1.0-F0)*pow(1.0-max(dot(H,V),0.0), 5.0);
+    vec3 specB = D*G*F / max(4.0*NdV*NdL, 0.001);
+    vec3 kd = (1.0-F)*(1.0-metal);
 
-    vec3 amb = mix(ambGround, ambSky, n.y*0.5+0.5) * albedo;
-    vec3 col = amb + albedo*lightColor*NdL*sh*(1.0-metal) + lightColor*spec*sh*F;
+    vec3 col = (kd*albedo/3.14159*3.14159 + specB) * lightColor * NdL * sh;
+    vec3 amb = mix(ambGround, ambSky, n.y*0.5+0.5) * albedo * ao * (1.0-metal*0.5);
+    col += amb;
     vec3 R = reflect(-V,n);
-    vec3 env = mix(fogColor, ambSky*2.2, clamp(R.y,0.0,1.0));
-    col += env * F * (1.0-rough) * (water?1.2:0.6);
+    vec3 Fe = F0 + (max(vec3(1.0-rough), F0)-F0)*pow(1.0-NdV, 5.0);
+    float sunR = pow(max(dot(R,L),0.0), 300.0) * (1.0-rough) * 30.0;
+    vec3 env = mix(fogColor*1.1, ambSky*2.4, smoothstep(-0.05, 0.6, R.y));
+    if (R.y < 0.0) env = mix(env, ambGround*0.6, 0.6);
+    col += (env + lightColor*sunR*sh) * Fe * (1.0-rough*0.9) * ao * (water?1.3:1.0);
 
     // postes de luz procedurais nos cruzamentos
     vec2 c = (floor(fragPos.xz/blockP)+0.5)*blockP;
     vec3 lamp = vec3(c.x+4.0, 7.3, c.y+4.0);
     vec3 dl = lamp-fragPos; float d2 = dot(dl,dl);
-    col += albedo * vec3(1.0,0.6,0.25) * 60.0 / (d2+4.0) * max(dot(n,normalize(dl)),0.0) * night;
-    // farol do carro do jogador
+    col += albedo * vec3(1.0,0.6,0.25) * 140.0 / (d2+6.0) * max(dot(n,normalize(dl)),0.0) * night;
+    if (water || rough < 0.3) col += vec3(1.0,0.6,0.25) * pow(max(dot(R, normalize(dl)),0.0), 80.0) * night * 3.0;
     if (headOn>0.5){
         vec3 hd = fragPos-headPos; float hl = length(hd);
         float cone = smoothstep(0.82,0.95, dot(hd/hl, headDir));
-        col += albedo * vec3(1.0,0.95,0.85) * cone * 120.0/(hl*hl+6.0) * max(dot(n,-hd/hl),0.0);
+        col += albedo * vec3(1.0,0.95,0.85) * cone * 140.0/(hl*hl+6.0) * max(dot(n,-hd/hl),0.0);
     }
 
     col += emis + albedo*emissive;
     float dist = length(viewPos-fragPos);
     float fog = 1.0 - exp(-pow(dist*fogDensity, 1.5));
+    fog *= mix(1.0, 0.6, smoothstep(0.0, 80.0, fragPos.y));      // neblina por altura
     col = mix(col, fogColor, clamp(fog,0.0,1.0));
-    col = aces(col*1.1);
+    col = aces(col*1.15);
     finalColor = vec4(pow(col, vec3(1.0/2.2)), 1.0);
 })";
+
 
 static const char* SKY_FS = R"(#version 330
 in vec3 fragPos; in vec3 fragNormal;
@@ -160,41 +222,62 @@ void main(){
 static const char* DEPTH_FS = R"(#version 330
 out vec4 c; void main(){ c = vec4(1.0); })";
 
-// Pós-processamento: nitidez (upscale), bloom, aberração cromática, vinheta, grão
+// Pós-processamento: FXAA, nitidez (upscale), bloom, aberração cromática, vinheta, grão
 static const char* POST_FS = R"(#version 330
 in vec2 fragTexCoord; uniform sampler2D texture0; uniform vec2 srcRes; uniform float sharpen, time, bloomOn;
 out vec4 finalColor;
 float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
+float luma(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }
+vec3 fxaa(vec2 uv, vec2 px){
+    vec3 rgbM = texture(texture0, uv).rgb;
+    float lNW = luma(texture(texture0, uv+vec2(-1,-1)*px).rgb), lNE = luma(texture(texture0, uv+vec2(1,-1)*px).rgb);
+    float lSW = luma(texture(texture0, uv+vec2(-1,1)*px).rgb), lSE = luma(texture(texture0, uv+vec2(1,1)*px).rgb);
+    float lM = luma(rgbM);
+    float lMin = min(lM, min(min(lNW,lNE),min(lSW,lSE))), lMax = max(lM, max(max(lNW,lNE),max(lSW,lSE)));
+    vec2 dir = vec2(-((lNW+lNE)-(lSW+lSE)), ((lNW+lSW)-(lNE+lSE)));
+    float red = max((lNW+lNE+lSW+lSE)*0.03125, 1.0/128.0);
+    float rcp = 1.0/(min(abs(dir.x),abs(dir.y))+red);
+    dir = clamp(dir*rcp, -8.0, 8.0)*px;
+    vec3 A = 0.5*(texture(texture0, uv+dir*(1.0/3.0-0.5)).rgb + texture(texture0, uv+dir*(2.0/3.0-0.5)).rgb);
+    vec3 B = A*0.5 + 0.25*(texture(texture0, uv-dir*0.5).rgb + texture(texture0, uv+dir*0.5).rgb);
+    float lB = luma(B);
+    return (lB<lMin || lB>lMax) ? A : B;
+}
 void main(){
     vec2 uv = fragTexCoord; vec2 px = 1.0/srcRes;
     vec2 cc = uv-0.5;
-    vec3 c;
-    c.r = texture(texture0, uv - cc*0.0025).r;
-    c.g = texture(texture0, uv).g;
-    c.b = texture(texture0, uv + cc*0.0025).b;
+    vec3 c = fxaa(uv, px);
+    c.r = mix(c.r, texture(texture0, uv - cc*0.003).r, 0.6);
+    c.b = mix(c.b, texture(texture0, uv + cc*0.003).b, 0.6);
     if (sharpen>0.0){
         vec3 nb = texture(texture0,uv+vec2(px.x,0)).rgb + texture(texture0,uv-vec2(px.x,0)).rgb
                 + texture(texture0,uv+vec2(0,px.y)).rgb + texture(texture0,uv-vec2(0,px.y)).rgb;
-        c = clamp(c + (c*4.0-nb)*sharpen*0.25, 0.0, 1.0);
+        c = clamp(c + (c*4.0-nb)*sharpen*0.2, 0.0, 1.0);
     }
     if (bloomOn>0.5){
-        vec3 b = vec3(0.0);
-        for(int i=0;i<16;i++){
-            float a = float(i)*0.3927; float r = (i<8)?6.0:14.0;
+        vec3 b = vec3(0.0); float wsum = 0.0;
+        for(int i=0;i<24;i++){
+            float a = float(i)*2.39996; float r = 3.0 + float(i)*1.4; float w = 1.0/(1.0+float(i)*0.15);
             vec3 s = texture(texture0, uv+vec2(cos(a),sin(a))*px*r).rgb;
-            b += max(s-0.7,0.0);
+            b += max(s-0.65,0.0)*w; wsum += w;
         }
-        c += b/16.0*1.6;
+        c += b/wsum*2.2*vec3(1.0,0.92,0.85);
     }
-    c *= 1.0 - dot(cc,cc)*0.9;
-    c += (hash(uv*srcRes+time)-0.5)*0.025;
+    // grading: sombras levemente azul-petroleo, altas luzes quentes (look cinematografico)
+    float l = luma(c);
+    c = mix(c, c*vec3(0.92,1.0,1.06), (1.0-l)*0.35);
+    c = mix(c, c*vec3(1.06,1.0,0.92), l*0.3);
+    c = mix(vec3(l), c, 1.12);
+    c *= 1.0 - dot(cc,cc)*0.85;
+    c += (hash(uv*srcRes+time)-0.5)*0.02;
     finalColor = vec4(c,1.0);
 })";
+
 
 // =====================================================================================
 // Mundo
 // =====================================================================================
-struct Building { Vector3 pos, size; Color col; };
+struct Building { Vector3 pos, size; Color col; int style; Color neon; };
 struct Palm { Vector3 pos; float h, lean; };
 struct Car { Vector3 pos; float yaw, speed; Color col; int type; bool police; float stun; };
 struct Ped { Vector3 pos; float yaw, speed, phase; Color shirt; bool dead; };
@@ -225,41 +308,209 @@ static Matrix local(Vector3 base, float yaw, Vector3 off, Vector3 s, Matrix pre 
     return MatrixMultiply(m, MatrixMultiply(MatrixRotateY(yaw), MatrixTranslate(base.x, base.y, base.z)));
 }
 
+// =====================================================================================
+// Geração procedural de malhas
+// =====================================================================================
+struct MeshBuilder {
+    std::vector<float> v, n; std::vector<unsigned char> c;
+    void vert(Vector3 p, Vector3 nn, Color col) {
+        v.insert(v.end(), {p.x, p.y, p.z}); n.insert(n.end(), {nn.x, nn.y, nn.z}); c.insert(c.end(), {col.r, col.g, col.b, col.a});
+    }
+    void tri(Vector3 a, Vector3 b, Vector3 d, Color col) {
+        Vector3 nn = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(b, a), Vector3Subtract(d, a)));
+        vert(a, nn, col); vert(b, nn, col); vert(d, nn, col);
+    }
+    Mesh build() {
+        Mesh m = {0};
+        m.vertexCount = (int)v.size() / 3; m.triangleCount = m.vertexCount / 3;
+        m.vertices = (float*)MemAlloc(v.size() * sizeof(float)); memcpy(m.vertices, v.data(), v.size() * sizeof(float));
+        m.normals = (float*)MemAlloc(n.size() * sizeof(float)); memcpy(m.normals, n.data(), n.size() * sizeof(float));
+        m.colors = (unsigned char*)MemAlloc(c.size()); memcpy(m.colors, c.data(), c.size());
+        UploadMesh(&m, false);
+        return m;
+    }
+};
+
+static float keyInterp(const float (*k)[2], int count, float u) {
+    for (int i = 0; i < count - 1; i++) if (u <= k[i + 1][0]) {
+        float t = (u - k[i][0]) / (k[i + 1][0] - k[i][0]); t = t * t * (3 - 2 * t);
+        return k[i][1] + (k[i + 1][1] - k[i][1]) * t;
+    }
+    return k[count - 1][1];
+}
+
+// Carroceria de sedan: seções transversais superelípticas ao longo do comprimento, com vidros (alpha 0)
+static Mesh GenCarBody(float L, bool sporty) {
+    const int NS = 64, NR = 40;
+    static const float topK[][2] = {{0, 0.62f}, {0.03f, 0.92f}, {0.2f, 1.0f}, {0.36f, 1.42f}, {0.6f, 1.44f}, {0.76f, 1.03f}, {0.95f, 0.93f}, {1.0f, 0.6f}};
+    static const float topS[][2] = {{0, 0.6f}, {0.03f, 0.88f}, {0.16f, 0.95f}, {0.38f, 1.26f}, {0.56f, 1.27f}, {0.72f, 0.92f}, {0.95f, 0.84f}, {1.0f, 0.55f}};
+    std::vector<Vector3> P((NS + 1) * NR); std::vector<unsigned char> glass((NS + 1) * NR);
+    for (int i = 0; i <= NS; i++) {
+        float u = i / (float)NS, z = (u - 0.5f) * L;
+        float yt = sporty ? keyInterp(topS, 8, u) : keyInterp(topK, 8, u), yb = 0.3f;
+        float end = fminf(u, 1 - u); float endS = sqrtf(fminf(1.f, end / 0.035f));
+        float a = 0.92f * (1 - powf(fabsf(2 * u - 1), 8) * 0.18f) * (0.55f + 0.45f * endS);
+        bool cabin = yt > 1.1f || (sporty && yt > 1.0f);
+        float belt = sporty ? 0.9f : 1.0f;
+        for (int k = 0; k < NR; k++) {
+            float th = 2 * PI * k / NR, cs = cosf(th), sn = sinf(th);
+            float cx = copysignf(powf(fabsf(cs), 2.f / 5), cs), cy = copysignf(powf(fabsf(sn), 2.f / 5), sn);
+            float y = yb + (yt - yb) * (0.5f + 0.5f * cy);
+            float tumble = 1 - 0.3f * Clamp((y - belt) / fmaxf(yt - belt, 0.01f), 0, 1) * (cabin ? 1 : 0);
+            float x = a * cx * tumble;
+            if (y < 0.45f) x *= 0.94f;
+            P[i * NR + k] = {x, (y - yb) * endS + yb + (1 - endS) * 0.15f, z};
+            glass[i * NR + k] = (cabin && y > belt + 0.04f && y < yt - 0.06f) ? 1 : 0;
+        }
+    }
+    MeshBuilder mb;
+    auto at = [&](int i, int k) { return P[i * NR + (k + NR) % NR]; };
+    std::vector<Vector3> N(P.size());
+    for (int i = 0; i <= NS; i++) for (int k = 0; k < NR; k++) {
+        Vector3 du = Vector3Subtract(at(i < NS ? i + 1 : i, k), at(i > 0 ? i - 1 : i, k));
+        Vector3 dv = Vector3Subtract(at(i, k + 1), at(i, k - 1));
+        N[i * NR + k] = Vector3Normalize(Vector3CrossProduct(dv, du));
+    }
+    for (int i = 0; i < NS; i++) for (int k = 0; k < NR; k++) {
+        int a0 = i * NR + k, a1 = i * NR + (k + 1) % NR, b0 = (i + 1) * NR + k, b1 = (i + 1) * NR + (k + 1) % NR;
+        bool g = glass[a0] && glass[a1] && glass[b0] && glass[b1];
+        Color col = g ? Color{255, 255, 255, 0} : WHITE;
+        mb.vert(P[a0], N[a0], col); mb.vert(P[b1], N[b1], col); mb.vert(P[b0], N[b0], col);
+        mb.vert(P[a0], N[a0], col); mb.vert(P[a1], N[a1], col); mb.vert(P[b1], N[b1], col);
+    }
+    for (int e = 0; e < 2; e++) {   // tampas
+        int i = e ? NS : 0; Vector3 c = {0, 0.5f, P[i * NR].z}; Vector3 nn = {0, 0, e ? 1.f : -1.f};
+        for (int k = 0; k < NR; k++) {
+            Vector3 p0 = at(i, k), p1 = at(i, k + 1);
+            if (e) { mb.vert(c, nn, WHITE); mb.vert(p1, nn, WHITE); mb.vert(p0, nn, WHITE); }
+            else { mb.vert(c, nn, WHITE); mb.vert(p0, nn, WHITE); mb.vert(p1, nn, WHITE); }
+        }
+    }
+    return mb.build();
+}
+
+// Folha de palmeira: nervura curva com folíolos dos dois lados
+static Mesh GenFrond() {
+    MeshBuilder mb; const int S = 14;
+    auto spine = [](float s) { return Vector3{0, 0.7f * s - 1.9f * s * s, 4.2f * s}; };
+    for (int i = 0; i < S; i++) {
+        float s0 = i / (float)S, s1 = (i + 1) / (float)S;
+        Vector3 p0 = spine(s0), p1 = spine(s1);
+        for (int side = -1; side <= 1; side += 2) {
+            float l0 = 1.15f * sinf(PI * fminf(1, s0 * 1.1f + 0.05f)), l1 = 1.15f * sinf(PI * fminf(1, s1 * 1.1f + 0.05f));
+            Vector3 t0 = Vector3Add(p0, {side * l0, -0.35f * l0, 0.45f * l0}), t1 = Vector3Add(p1, {side * l1, -0.35f * l1, 0.45f * l1});
+            Color g0 = {(unsigned char)(70 + 40 * s0), (unsigned char)(130 + 30 * s0), 50, 255};
+            mb.tri(p0, p1, t0, g0); mb.tri(p1, t1, t0, g0);
+            mb.tri(p0, t0, p1, g0); mb.tri(p1, t0, t1, g0);   // dupla face
+        }
+    }
+    return mb.build();
+}
+
+static Model mCarBody, mCarSport, mFrond, mRim;
+
 static void drawCar(const Car& c, float t, float night) {
     Vector3 b = {c.pos.x, 0, c.pos.z};
-    float L = c.type == 1 ? 4.8f : 4.3f, W = 1.9f;
-    Color body = c.police ? Color{20, 20, 25, 255} : c.col;
-    drawM(mCube, local(b, c.yaw, {0, 0.75f, 0}, {W, 0.65f, L}), body, 0, 0.15f);
-    drawM(mCube, local(b, c.yaw, {0, 1.3f, -0.2f}, {W * 0.88f, 0.55f, L * 0.48f}), {15, 20, 28, 255}, 0, 0.05f);
-    if (c.police) drawM(mCube, local(b, c.yaw, {0, 0.76f, 0}, {W + 0.02f, 0.3f, L * 0.5f}), RAYWHITE, 0, 0.2f);
-    float spin = -c.pos.x * 0.0f;
+    float L = 4.6f, W = 1.84f;
+    Color body = c.police ? Color{235, 235, 240, 255} : c.col;
+    drawM(c.type == 1 ? mCarSport : mCarBody, local(b, c.yaw, {0, 0, 0}, {1, 1, 1}), body, 0, 0.2f, 4);
+    if (c.police) drawM(mCube, local(b, c.yaw, {0, 0.66f, 0.1f}, {W * 0.995f, 0.28f, 1.9f}), {15, 15, 20, 255}, 0, 0.25f);
     for (int i = 0; i < 4; i++) {
-        float sx = (i & 1) ? W / 2 : -W / 2, sz = (i & 2) ? L * 0.33f : -L * 0.33f;
-        drawM(mCyl, local(b, c.yaw, {sx, 0.38f, sz}, {1, 1, 1}, MatrixMultiply(MatrixTranslate(0, -0.13f, 0), MatrixRotateZ(PI / 2 + spin))), {20, 20, 20, 255}, 0, 0.9f);
+        float s = (i & 1) ? 1.f : -1.f, sz = (i & 2) ? L * 0.31f : -L * 0.3f;
+        Matrix rot = MatrixMultiply(MatrixTranslate(0, -0.13f, 0), MatrixRotateZ(PI / 2));
+        drawM(mCyl, local(b, c.yaw, {s * (W / 2 - 0.12f), 0.38f, sz}, {1, 1, 1}, rot), {18, 18, 18, 255}, 0, 0.85f);
+        drawM(mRim, local(b, c.yaw, {s * (W / 2 - 0.1f), 0.38f, sz}, {1, 1, 1}, rot), {170, 172, 178, 255}, 0, 0.2f);
     }
-    float hl = 0.3f + night * 3.f;
-    drawM(mCube, local(b, c.yaw, {-W * 0.32f, 0.85f, L / 2}, {0.4f, 0.15f, 0.05f}), {255, 250, 230, 255}, hl, 0.1f);
-    drawM(mCube, local(b, c.yaw, {W * 0.32f, 0.85f, L / 2}, {0.4f, 0.15f, 0.05f}), {255, 250, 230, 255}, hl, 0.1f);
-    drawM(mCube, local(b, c.yaw, {-W * 0.35f, 0.85f, -L / 2}, {0.4f, 0.12f, 0.05f}), {255, 20, 20, 255}, 0.5f + night * 2, 0.1f);
-    drawM(mCube, local(b, c.yaw, {W * 0.35f, 0.85f, -L / 2}, {0.4f, 0.12f, 0.05f}), {255, 20, 20, 255}, 0.5f + night * 2, 0.1f);
+    float hl = 0.4f + night * 4.f;
+    for (int s = -1; s <= 1; s += 2) {
+        drawM(mSphere, local(b, c.yaw, {s * W * 0.33f, 0.78f, L / 2 - 0.12f}, {0.22f, 0.07f, 0.1f}), {255, 250, 230, 255}, hl, 0.05f);
+        drawM(mSphere, local(b, c.yaw, {s * W * 0.36f, 0.86f, -L / 2 + 0.1f}, {0.2f, 0.06f, 0.08f}), {255, 15, 15, 255}, 0.6f + night * 2.5f, 0.05f);
+        drawM(mCube, local(b, c.yaw, {s * W * 0.47f, 1.0f, L * 0.12f}, {0.18f, 0.08f, 0.1f}), body, 0, 0.2f, 4);   // retrovisores
+    }
     if (c.police) {
         bool ph = fmodf(t * 4, 1) < 0.5f;
-        drawM(mCube, local(b, c.yaw, {-0.35f, 1.65f, -0.2f}, {0.6f, 0.15f, 0.25f}), {255, 30, 30, 255}, ph ? 8.f : 0.3f);
-        drawM(mCube, local(b, c.yaw, {0.35f, 1.65f, -0.2f}, {0.6f, 0.15f, 0.25f}), {30, 60, 255, 255}, ph ? 0.3f : 8.f);
+        drawM(mCube, local(b, c.yaw, {-0.3f, 1.5f, -0.1f}, {0.5f, 0.12f, 0.22f}), {255, 30, 30, 255}, ph ? 10.f : 0.3f);
+        drawM(mCube, local(b, c.yaw, {0.3f, 1.5f, -0.1f}, {0.5f, 0.12f, 0.22f}), {30, 60, 255, 255}, ph ? 0.3f : 10.f);
     }
 }
 
 static void drawHuman(Vector3 p, float yaw, float phase, float moving, Color shirt, Color pants, Color skin) {
-    float sw = sinf(phase) * 0.6f * moving, bob = fabsf(sinf(phase)) * 0.05f * moving;
-    Vector3 b = {p.x, bob, p.z};
-    drawM(mCube, local(b, yaw, {0, 1.25f, 0}, {0.5f, 0.6f, 0.28f}), shirt, 0, 0.8f);
-    drawM(mSphere, local(b, yaw, {0, 1.75f, 0}, {0.2f, 0.24f, 0.22f}), skin, 0, 0.6f);
-    drawM(mSphere, local(b, yaw, {0, 1.86f, -0.02f}, {0.21f, 0.12f, 0.22f}), {30, 20, 15, 255}, 0, 0.9f);
+    float sw = sinf(phase) * 0.55f * moving, bob = fabsf(sinf(phase)) * 0.045f * moving;
+    Vector3 b = {p.x, p.y + bob, p.z};
+    Color hair = {35, 24, 18, 255};
+    drawM(mSphere, local(b, yaw, {0, 1.33f, 0}, {0.22f, 0.3f, 0.14f}), shirt, 0, 0.85f);              // torso
+    drawM(mSphere, local(b, yaw, {0, 1.5f, 0}, {0.25f, 0.12f, 0.14f}), shirt, 0, 0.85f);              // ombros
+    drawM(mSphere, local(b, yaw, {0, 0.98f, 0}, {0.19f, 0.13f, 0.13f}), pants, 0, 0.85f);             // quadril
+    drawM(mSphere, local(b, yaw, {0, 1.63f, 0}, {0.055f, 0.08f, 0.055f}), skin, 0, 0.6f);             // pescoço
+    drawM(mSphere, local(b, yaw, {0, 1.74f, 0.01f}, {0.1f, 0.125f, 0.115f}), skin, 0, 0.55f);         // cabeça
+    drawM(mSphere, local(b, yaw, {0, 1.79f, -0.015f}, {0.105f, 0.095f, 0.115f}), hair, 0, 0.9f);      // cabelo
     for (int s = -1; s <= 1; s += 2) {
-        Matrix leg = MatrixMultiply(MatrixTranslate(0, -0.42f, 0), MatrixRotateX(sw * s));
-        drawM(mCube, local(b, yaw, {0.13f * s, 0.88f, 0}, {0.19f, 0.84f, 0.22f}, leg), pants, 0, 0.85f);
-        Matrix arm = MatrixMultiply(MatrixTranslate(0, -0.3f, 0), MatrixRotateX(-sw * s * 0.8f));
-        drawM(mCube, local(b, yaw, {0.33f * s, 1.52f, 0}, {0.13f, 0.6f, 0.14f}, arm), skin, 0, 0.6f);
+        Matrix hip = MatrixRotateX(sw * s);
+        Matrix thigh = MatrixMultiply(MatrixTranslate(0, -0.22f, 0), hip);
+        drawM(mSphere, local(b, yaw, {0.1f * s, 0.95f, 0}, {0.085f, 0.24f, 0.095f}, thigh), pants, 0, 0.85f);
+        float knee = fmaxf(0, -sw * s) * 0.9f;
+        Matrix shin = MatrixMultiply(MatrixMultiply(MatrixTranslate(0, -0.22f, 0), MatrixRotateX(knee)), MatrixMultiply(MatrixTranslate(0, -0.44f, 0), hip));
+        drawM(mSphere, local(b, yaw, {0.1f * s, 0.95f, 0}, {0.07f, 0.24f, 0.08f}, shin), pants, 0, 0.85f);
+        Matrix foot = MatrixMultiply(MatrixMultiply(MatrixTranslate(0, -0.47f, 0.06f), MatrixRotateX(knee)), MatrixMultiply(MatrixTranslate(0, -0.44f, 0), hip));
+        drawM(mSphere, local(b, yaw, {0.1f * s, 0.95f, 0}, {0.06f, 0.045f, 0.13f}, foot), {30, 30, 32, 255}, 0, 0.5f);
+        Matrix sh = MatrixMultiply(MatrixRotateZ(0.08f * s), MatrixRotateX(-sw * s * 0.8f));
+        Matrix upper = MatrixMultiply(MatrixTranslate(0, -0.15f, 0), sh);
+        drawM(mSphere, local(b, yaw, {0.27f * s, 1.5f, 0}, {0.06f, 0.16f, 0.065f}, upper), shirt, 0, 0.85f);
+        Matrix fore = MatrixMultiply(MatrixMultiply(MatrixTranslate(0, -0.14f, 0), MatrixRotateX(-0.3f - fmaxf(0, sw * s) * 0.6f)), MatrixMultiply(MatrixTranslate(0, -0.3f, 0), sh));
+        drawM(mSphere, local(b, yaw, {0.27f * s, 1.5f, 0}, {0.048f, 0.15f, 0.05f}, fore), skin, 0, 0.6f);
+    }
+}
+
+// =====================================================================================
+// Texturas: carrega fotos PBR (assets/*.jpg, baixadas do Poly Haven no build) ou gera por código
+// =====================================================================================
+static float phash(int x, int y, int per) { x = ((x % per) + per) % per; y = ((y % per) + per) % per;
+    unsigned h = (unsigned)(x * 374761393 + y * 668265263); h = (h ^ (h >> 13)) * 1274126177u; return (h ^ (h >> 16)) / 4294967295.f; }
+static float pnoise(float x, float y, int per) {
+    int ix = (int)floorf(x), iy = (int)floorf(y); float fx = x - ix, fy = y - iy;
+    fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+    return Lerp(Lerp(phash(ix, iy, per), phash(ix + 1, iy, per), fx), Lerp(phash(ix, iy + 1, per), phash(ix + 1, iy + 1, per), fx), fy);
+}
+static float pfbm(float x, float y, int per) { float v = 0, a = 0.5f; for (int i = 0; i < 6; i++) { v += a * pnoise(x, y, per); x *= 2; y *= 2; per *= 2; a *= 0.5f; } return v; }
+
+static void GenMaterialImages(int kind, Image& diff, Image& nor) {
+    const int S = 512; std::vector<float> h(S * S);
+    diff = GenImageColor(S, S, WHITE); nor = GenImageColor(S, S, WHITE);
+    Color* d = (Color*)diff.data;
+    for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+        float u = x / (float)S * 8, v = y / (float)S * 8, f = pfbm(u, v, 8), w = phash(x, y, S);
+        float r, g, b, ht;
+        if (kind == 0) { float k = 0.28f + 0.14f * f + 0.06f * (w > 0.96f ? w : 0) - 0.05f * pnoise(u * 0.5f, v * 0.5f, 4); r = k; g = k; b = k * 1.04f; ht = f * 0.6f + w * 0.4f; }
+        else if (kind == 1) {
+            float tu = fmodf(u * 0.5f, 1), tv = fmodf(v * 0.5f, 1); int tx = (int)(u * 0.5f), ty = (int)(v * 0.5f);
+            float groove = fminf(fminf(tu, 1 - tu), fminf(tv, 1 - tv)); float gm = Clamp(groove / 0.025f, 0, 1);
+            float k = (0.55f + 0.08f * phash(tx, ty, 4) + 0.1f * f) * (0.45f + 0.55f * gm); r = k; g = k * 0.98f; b = k * 0.95f; ht = gm * 0.8f + f * 0.2f;
+        } else if (kind == 2) { float rip = sinf(u * 6 + f * 6) * 0.5f + 0.5f; float k = 0.9f + 0.12f * f + 0.03f * (w - 0.5f); r = 0.8f * k; g = 0.69f * k; b = 0.5f * k; ht = rip * 0.3f + w * 0.5f + f * 0.2f; }
+        else { float k = 0.82f + 0.08f * f + 0.01f * (w - 0.5f); r = k; g = k * 0.985f; b = k * 0.96f; ht = f * 0.9f + w * 0.1f; }
+        d[y * S + x] = {(unsigned char)(Clamp(r, 0, 1) * 255), (unsigned char)(Clamp(g, 0, 1) * 255), (unsigned char)(Clamp(b, 0, 1) * 255), 255};
+        h[y * S + x] = ht;
+    }
+    Color* n = (Color*)nor.data; float str = kind == 1 ? 6.f : 3.f;
+    for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+        float dx = h[y * S + (x + 1) % S] - h[y * S + (x + S - 1) % S], dy = h[((y + 1) % S) * S + x] - h[((y + S - 1) % S) * S + x];
+        Vector3 nn = Vector3Normalize({-dx * str, -dy * str, 1});
+        n[y * S + x] = {(unsigned char)((nn.x * 0.5f + 0.5f) * 255), (unsigned char)((nn.y * 0.5f + 0.5f) * 255), (unsigned char)((nn.z * 0.5f + 0.5f) * 255), 255};
+    }
+}
+
+static Texture2D texD[4], texN[4];
+static void LoadMaterials() {
+    const char* names[] = {"asphalt", "paving", "sand", "plaster"};
+    for (int i = 0; i < 4; i++) {
+        std::string base = std::string(GetApplicationDirectory()) + "assets/" + names[i];
+        Image d, n;
+        if (FileExists((base + "_diff.jpg").c_str()) && FileExists((base + "_nor.jpg").c_str())) {
+            d = LoadImage((base + "_diff.jpg").c_str()); n = LoadImage((base + "_nor.jpg").c_str());
+            TraceLog(LOG_INFO, "Material fotografico: %s", names[i]);
+        } else GenMaterialImages(i, d, n);
+        texD[i] = LoadTextureFromImage(d); texN[i] = LoadTextureFromImage(n);
+        UnloadImage(d); UnloadImage(n);
+        for (Texture2D* t : {&texD[i], &texN[i]}) { GenTextureMipmaps(t); SetTextureFilter(*t, TEXTURE_FILTER_ANISOTROPIC_16X); SetTextureWrap(*t, TEXTURE_WRAP_REPEAT); }
     }
 }
 
@@ -319,7 +570,14 @@ int main() {
     mSphere = LoadModelFromMesh(GenMeshSphere(1, 16, 16));
     mPlane = LoadModelFromMesh(GenMeshPlane(1, 1, 64, 64));
     Model mSky = LoadModelFromMesh(GenMeshSphere(1, 32, 32));
-    Model* all[] = {&mCube, &mCyl, &mSphere, &mPlane};
+    mCarBody = LoadModelFromMesh(GenCarBody(4.6f, false));
+    mCarSport = LoadModelFromMesh(GenCarBody(4.6f, true));
+    mFrond = LoadModelFromMesh(GenFrond());
+    mRim = LoadModelFromMesh(GenMeshCylinder(0.25f, 0.27f, 20));
+    Model* all[] = {&mCube, &mCyl, &mSphere, &mPlane, &mCarBody, &mCarSport, &mFrond, &mRim};
+    LoadMaterials();
+    const char* tnames[] = {"tAsphD", "tPaveD", "tSandD", "tWallD", "tAsphN", "tPaveN", "tSandN", "tWallN"};
+    for (int i = 0; i < 8; i++) { int sl = 1 + i; SetShaderValue(lit, GetShaderLocation(lit, tnames[i]), &sl, SHADER_UNIFORM_INT); }
     mSky.materials[0].shader = sky;
     RenderTexture2D shadowMap = LoadShadowmap(4096);
 
@@ -339,7 +597,8 @@ int main() {
             float w = BLOCK / nx - frand(2, 6), d = BLOCK / nz - frand(2, 6);
             float h = downtown ? frand(50, 170) / (1 + dc * 0.25f) + 20 : frand(7, 28);
             Vector3 pos = {cx - BLOCK / 2 + (i + 0.5f) * BLOCK / nx, h / 2, cz - BLOCK / 2 + (j + 0.5f) * BLOCK / nz};
-            buildings.push_back({pos, {w, h, d}, downtown && rand() % 2 ? Color{180, 195, 205, 255} : pastel[rand() % 7]});
+            Color neons[] = {{255, 40, 160, 255}, {40, 230, 255, 255}, {255, 140, 30, 255}, {150, 60, 255, 255}};
+            buildings.push_back({pos, {w, h, d}, downtown && rand() % 2 ? Color{180, 195, 205, 255} : pastel[rand() % 7], downtown ? 0 : 1 + rand() % 2, neons[rand() % 4]});
         }
         if (!downtown) palms.push_back({{cx + BLOCK / 2 - 1.5f, 0.15f, cz + frand(-BLOCK / 2, BLOCK / 2)}, frand(8, 12), frand(-0.1f, 0.1f)});
     }
@@ -368,6 +627,8 @@ int main() {
     float shake = 0; int skipMouse = 5;
     RenderTexture2D rt = {0};
     if (getenv("NC_PLAY")) screen = PLAYING;
+    if (getenv("NC_X")) { player.x = (float)atof(getenv("NC_X")); playerCar.pos.x = player.x - 4; }
+    if (getenv("NC_YAW")) camYaw = (float)atof(getenv("NC_YAW"));
     if (getenv("NC_TOD")) timeOfDay = (float)atof(getenv("NC_TOD"));
 
     while (!WindowShouldClose()) {
@@ -528,10 +789,10 @@ int main() {
         float night = 1 - Clamp(sunH * 6 + 0.5f, 0, 1);
         Vector3 lightDir = sunH > -0.05f ? sunDir : Vector3Normalize({-sunDir.x, -sunDir.y, 0.4f});
         Vector3 sunCol = Vector3Lerp({3.2f, 1.3f, 0.55f}, {3.0f, 2.85f, 2.6f}, Clamp(sunH * 3, 0, 1));
-        Vector3 lightCol = sunH > -0.05f ? Vector3Scale(sunCol, Clamp(sunH * 8, 0, 1)) : Vector3{0.12f, 0.16f, 0.3f};
+        Vector3 lightCol = sunH > -0.05f ? Vector3Scale(sunCol, Clamp(sunH * 8, 0, 1)) : Vector3{0.18f, 0.22f, 0.4f};
         Vector3 zen = Vector3Lerp({0.01f, 0.015f, 0.05f}, {0.12f, 0.32f, 0.75f}, day);
         Vector3 hor = Vector3Lerp(Vector3Lerp({0.04f, 0.04f, 0.09f}, {0.65f, 0.8f, 0.95f}, day), {1.1f, 0.45f, 0.3f}, dusk * 0.8f);
-        Vector3 ambS = Vector3Lerp({0.04f, 0.05f, 0.1f}, {0.35f, 0.45f, 0.6f}, day); ambS = Vector3Lerp(ambS, {0.35f, 0.22f, 0.3f}, dusk * 0.5f);
+        Vector3 ambS = Vector3Lerp({0.07f, 0.08f, 0.15f}, {0.35f, 0.45f, 0.6f}, day); ambS = Vector3Lerp(ambS, {0.35f, 0.22f, 0.3f}, dusk * 0.5f);
         Vector3 ambG = Vector3Scale(ambS, 0.35f);
         Vector3 fogC = Vector3Scale(hor, 0.9f);
         float fogD = 0.0019f + dusk * 0.0008f;
@@ -568,7 +829,7 @@ int main() {
                 float cx = x * P, cz = z * P;
                 if (cx > beachX - P / 2) continue;
                 if (Vector2Distance({cx, cz}, {focusPt.x, focusPt.z}) > cullR) continue;
-                drawM(mCube, TRS({cx, 0.075f, cz}, 0, {BLOCK, 0.15f, BLOCK}), {150, 148, 140, 255}, 0, 0.85f);
+                drawM(mCube, TRS({cx, 0.075f, cz}, 0, {BLOCK, 0.15f, BLOCK}), {200, 198, 192, 255}, 0, 0.85f, 3);
                 Vector3 lp = {cx + P / 2 - 3.f, 0, cz + P / 2 - 3.f};
                 drawM(mCube, TRS({lp.x, 4, lp.z}, 0, {0.18f, 8, 0.18f}), {50, 52, 55, 255}, 0, 0.4f);
                 drawM(mCube, TRS({cx + P / 2 + 4.f, 7.4f, cz + P / 2 + 4.f}, 0, {0.6f, 0.15f, 0.6f}), {255, 220, 170, 255}, night * 6, 0.2f);
@@ -578,21 +839,35 @@ int main() {
                 drawM(mCube, TRS(b.pos, 0, b.size), b.col, 0, 0.75f, 2);
                 drawM(mCube, TRS({b.pos.x, b.size.y + 0.4f, b.pos.z}, 0, {b.size.x + 0.4f, 0.8f, b.size.z + 0.4f}), {225, 222, 215, 255}, 0, 0.8f);
                 if (b.size.y > 40) drawM(mCube, TRS({b.pos.x, b.size.y + 3.f, b.pos.z}, 0, {b.size.x * 0.4f, 5, b.size.z * 0.4f}), {120, 125, 130, 255}, 0, 0.5f);
+                if (b.style > 0) {   // art deco: frisos por andar, toldo, letreiro neon
+                    Color trim = {245, 243, 236, 255};
+                    for (float y = 3.6f; y < b.size.y - 1; y += 3.6f)
+                        drawM(mCube, TRS({b.pos.x, y + 0.05f, b.pos.z}, 0, {b.size.x + 0.35f, 0.22f, b.size.z + 0.35f}), trim, 0, 0.7f);
+                    drawM(mCube, TRS({b.pos.x, 3.2f, b.pos.z + b.size.z / 2 + 0.9f}, 0, {b.size.x * 0.8f, 0.12f, 1.8f}), b.neon, 0, 0.6f);
+                    float sw = fminf(b.size.x * 0.6f, 9.f);
+                    drawM(mCube, TRS({b.pos.x, b.size.y - 1.4f, b.pos.z + b.size.z / 2 + 0.15f}, 0, {sw, 0.35f, 0.15f}), b.neon, 0.4f + night * 9, 0.3f);
+                    if (b.style == 2) {
+                        drawM(mCube, TRS({b.pos.x, b.size.y / 2 + 1, b.pos.z + b.size.z / 2 + 0.3f}, 0, {1.2f, b.size.y + 2, 0.6f}), trim, 0, 0.7f);
+                        drawM(mCube, TRS({b.pos.x, b.size.y / 2 + 1, b.pos.z + b.size.z / 2 + 0.62f}, 0, {0.18f, b.size.y, 0.08f}), b.neon, 0.4f + night * 9, 0.3f);
+                    }
+                } else {
+                    for (int k = 0; k < 3; k++) drawM(mCube, TRS({b.pos.x + (k - 1) * b.size.x * 0.25f, b.size.y + 1.2f, b.pos.z - b.size.z * 0.25f}, 0, {2.2f, 1.6f, 2.2f}), {150, 152, 155, 255}, 0, 0.5f);
+                }
             }
             for (auto& p : palms) {
                 if (Vector2Distance({p.pos.x, p.pos.z}, {focusPt.x, focusPt.z}) > cullR) continue;
                 Matrix lean = MatrixRotateZ(p.lean);
-                for (int s = 0; s < 6; s++) {
-                    float y0 = p.h * s / 6.f;
-                    Vector3 o = Vector3Transform({0, y0 + p.h / 12, 0}, lean);
-                    drawM(mCube, MatrixMultiply(MatrixMultiply(MatrixScale(0.42f - s * 0.03f, p.h / 6.f + 0.05f, 0.42f - s * 0.03f), lean), MatrixTranslate(p.pos.x + o.x, p.pos.y + o.y, p.pos.z + o.z)), {125, 100, 75, 255}, 0, 0.95f);
+                for (int s = 0; s < 14; s++) {
+                    float y0 = p.h * (s + 0.5f) / 14.f, rr = 0.26f - s * 0.006f;
+                    Vector3 o = Vector3Transform({0, y0, 0}, lean);
+                    drawM(mSphere, MatrixMultiply(MatrixMultiply(MatrixScale(rr, p.h / 22.f, rr), lean), MatrixTranslate(p.pos.x + o.x, p.pos.y + o.y, p.pos.z + o.z)), {130, 108, 82, 255}, 0, 0.95f);
                 }
                 Vector3 top = Vector3Add(p.pos, Vector3Transform({0, p.h, 0}, lean));
-                for (int i = 0; i < 9; i++) {
-                    float a = i * 2 * PI / 9 + p.pos.x, sway = sinf(t * 1.3f + p.pos.z + i) * 0.06f;
-                    Matrix fr = MatrixMultiply(MatrixMultiply(MatrixMultiply(MatrixTranslate(0, 0, 2.2f), MatrixScale(0.9f, 0.08f, 1)), MatrixRotateX(0.55f + sway + (i % 2) * 0.2f)), MatrixRotateY(a));
-                    fr = MatrixMultiply(MatrixMultiply(MatrixScale(1, 1, 1), fr), MatrixTranslate(top.x, top.y, top.z));
-                    drawM(mCube, MatrixMultiply(MatrixScale(1, 1, 1), fr), {55, 120, 45, 255}, 0, 0.7f);
+                drawM(mSphere, TRS(top, 0, {0.4f, 0.35f, 0.4f}), {90, 75, 45, 255}, 0, 0.9f);
+                for (int i = 0; i < 11; i++) {
+                    float a = i * 2 * PI / 11 + p.pos.x, sway = sinf(t * 1.1f + p.pos.z + i * 0.7f) * 0.05f;
+                    Matrix fr = MatrixMultiply(MatrixMultiply(MatrixRotateX(-0.25f + sway + (i % 3) * 0.18f), MatrixRotateY(a)), MatrixTranslate(top.x, top.y, top.z));
+                    drawM(mFrond, fr, WHITE, 0, 0.6f);
                 }
             }
             for (auto& c : cars) if (Vector3Distance(c.pos, focusPt) < cullR) drawCar(c, t, night);
@@ -638,7 +913,9 @@ int main() {
         DrawModel(mSky, {0, 0, 0}, 1, WHITE);
         rlEnableDepthMask(); rlEnableBackfaceCulling();
         rlDrawRenderBatchActive();
-        int slot = 10; rlActiveTextureSlot(slot); rlEnableTexture(shadowMap.depth.id); rlActiveTextureSlot(0);
+        int slot = 10; rlActiveTextureSlot(slot); rlEnableTexture(shadowMap.depth.id);
+        for (int i = 0; i < 4; i++) { rlActiveTextureSlot(1 + i); rlEnableTexture(texD[i].id); rlActiveTextureSlot(5 + i); rlEnableTexture(texN[i].id); }
+        rlActiveTextureSlot(0);
         SetShaderValue(lit, lShadow, &slot, SHADER_UNIFORM_INT);
         drawWorld();
         EndMode3D();
