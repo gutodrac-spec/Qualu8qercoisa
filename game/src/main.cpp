@@ -13,10 +13,11 @@
 // Shaders
 // =====================================================================================
 static const char* LIT_VS = R"(#version 330
-in vec3 vertexPosition; in vec3 vertexNormal; in vec4 vertexColor;
+in vec3 vertexPosition; in vec3 vertexNormal; in vec4 vertexColor; in vec2 vertexTexCoord;
 uniform mat4 mvp; uniform mat4 matModel; uniform mat4 matNormal;
-out vec3 fragPos; out vec3 fragNormal; out vec4 vcol;
+out vec3 fragPos; out vec3 fragNormal; out vec4 vcol; out vec2 uv0;
 void main(){
+    uv0 = vertexTexCoord;
     fragPos = (matModel*vec4(vertexPosition,1.0)).xyz;
     fragNormal = normalize((matNormal*vec4(vertexNormal,0.0)).xyz);
     vcol = vertexColor;
@@ -24,8 +25,8 @@ void main(){
 })";
 
 static const char* LIT_FS = R"(#version 330
-in vec3 fragPos; in vec3 fragNormal; in vec4 vcol;
-uniform vec4 colDiffuse;
+in vec3 fragPos; in vec3 fragNormal; in vec4 vcol; in vec2 uv0;
+uniform vec4 colDiffuse; uniform sampler2D texture0;
 uniform vec3 lightDir, lightColor, ambSky, ambGround, viewPos, fogColor;
 uniform float fogDensity, night, time, emissive, roughness;
 uniform int surface;            // 0 generico, 1 terreno, 2 fachada, 3 calcada, 4 pintura automotiva
@@ -67,7 +68,9 @@ float shadow(vec3 n){
 
 void main(){
     vec3 n = normalize(fragNormal);
-    vec3 albedo = srgb(colDiffuse.rgb) * vcol.rgb;
+    vec4 tex = texture(texture0, uv0);
+    if (tex.a < 0.4) discard;
+    vec3 albedo = srgb(colDiffuse.rgb * tex.rgb) * vcol.rgb;
     vec3 V = normalize(viewPos-fragPos);
     float rough = roughness, metal = 0.0, ao = 1.0; vec3 emis = vec3(0.0);
     bool water = false;
@@ -407,12 +410,86 @@ static Mesh GenFrond() {
     return mb.build();
 }
 
+// =====================================================================================
+// Modelos externos hiper-realistas (.glb/.gltf de Sketchfab, Fab, etc.) em models/
+// Se o arquivo existir ele substitui o modelo procedural correspondente.
+// =====================================================================================
+struct Ext { Model m = {0}; bool ok = false; Matrix fix = MatrixIdentity(); ModelAnimation* anims = nullptr; int animCount = 0, walk = -1, idle = -1, run = -1; };
+static Ext extPolice, extPlayer, extPalm;
+static std::vector<Ext> extCars, extPeds;
+
+static Ext LoadExt(const char* name, float target, bool byLength) {
+    Ext e;
+    std::string dir = std::string(GetApplicationDirectory()) + "models/", path;
+    for (const char* ext : {".glb", ".gltf"}) if (FileExists((dir + name + ext).c_str())) { path = dir + name + ext; break; }
+    if (path.empty()) return e;
+    e.m = LoadModel(path.c_str());
+    if (e.m.meshCount == 0) return e;
+    BoundingBox bb = GetModelBoundingBox(e.m);
+    Vector3 sz = Vector3Subtract(bb.max, bb.min);
+    float yaw = 0;
+    std::string yf = dir + name + ".yaw";   // arquivo opcional com a rotação em graus para alinhar a frente com +Z
+    if (FileExists(yf.c_str())) { char* s = LoadFileText(yf.c_str()); yaw = (float)atof(s) * DEG2RAD; UnloadFileText(s); }
+    else if (byLength && sz.x > sz.z) yaw = PI / 2;
+    float ref = byLength ? fmaxf(sz.x, sz.z) : sz.y;
+    float sc = target / fmaxf(ref, 0.001f);
+    Vector3 c = {(bb.min.x + bb.max.x) / 2, bb.min.y, (bb.min.z + bb.max.z) / 2};
+    e.fix = MatrixMultiply(MatrixMultiply(MatrixTranslate(-c.x, -c.y, -c.z), MatrixScale(sc, sc, sc)), MatrixRotateY(yaw));
+    for (int i = 0; i < e.m.materialCount; i++) e.m.materials[i].shader = lit;
+    e.anims = LoadModelAnimations(path.c_str(), &e.animCount);
+    for (int i = 0; i < e.animCount; i++) {
+        if (!IsModelAnimationValid(e.m, e.anims[i])) continue;
+        std::string n = TextToLower(e.anims[i].name);
+        if (n.find("walk") != std::string::npos && e.walk < 0) e.walk = i;
+        else if (n.find("run") != std::string::npos && e.run < 0) e.run = i;
+        else if (n.find("idle") != std::string::npos && e.idle < 0) e.idle = i;
+    }
+    if (e.walk < 0 && e.animCount > 0 && IsModelAnimationValid(e.m, e.anims[0])) e.walk = 0;
+    e.ok = true;
+    TraceLog(LOG_INFO, "Modelo externo carregado: %s (%d animacoes)", path.c_str(), e.animCount);
+    return e;
+}
+
+static void LoadExternalModels() {
+    for (int i = 1; i <= 8; i++) { Ext e = LoadExt(TextFormat("car%d", i), 4.6f, true); if (e.ok) extCars.push_back(e); }
+    { Ext e = LoadExt("car", 4.6f, true); if (e.ok) extCars.push_back(e); }
+    for (int i = 1; i <= 8; i++) { Ext e = LoadExt(TextFormat("pedestrian%d", i), 1.78f, false); if (e.ok) extPeds.push_back(e); }
+    extPolice = LoadExt("police", 4.9f, true);
+    extPlayer = LoadExt("player", 1.8f, false);
+    extPalm = LoadExt("palm", 10.f, false);
+}
+
+static void SetExtShader(Shader s) {
+    auto set = [&](Ext& e) { if (e.ok) for (int i = 0; i < e.m.materialCount; i++) e.m.materials[i].shader = s; };
+    set(extPolice); set(extPlayer); set(extPalm);
+    for (auto& e : extCars) set(e);
+    for (auto& e : extPeds) set(e);
+}
+
+static void drawExt(Ext& e, Matrix world, int anim = -1, float animTime = 0, float rough = 0.5f) {
+    if (anim >= 0 && anim < e.animCount && e.anims[anim].frameCount > 0)
+        UpdateModelAnimation(e.m, e.anims[anim], (int)(animTime * 30) % e.anims[anim].frameCount);
+    if (!shadowPass) { setUniF(locEmissive, 0); setUniF(locRough, rough); setUniI(locSurface, 0); }
+    e.m.transform = MatrixMultiply(e.fix, world);
+    DrawModel(e.m, {0, 0, 0}, 1.f, WHITE);
+}
+
 static Model mCarBody, mCarSport, mFrond, mRim;
 
 static void drawCar(const Car& c, float t, float night) {
     Vector3 b = {c.pos.x, 0, c.pos.z};
     float L = 4.6f, W = 1.84f;
     Color body = c.police ? Color{235, 235, 240, 255} : c.col;
+    Ext* ex = (c.police && extPolice.ok) ? &extPolice : (!c.police && !extCars.empty()) ? &extCars[(c.col.r + c.col.g + c.type) % extCars.size()] : nullptr;
+    if (ex) {
+        drawExt(*ex, local(b, c.yaw, {0, 0, 0}, {1, 1, 1}), -1, 0, 0.25f);
+        if (c.police) {
+            bool ph = fmodf(t * 4, 1) < 0.5f;
+            drawM(mCube, local(b, c.yaw, {-0.3f, 1.55f, -0.1f}, {0.5f, 0.12f, 0.22f}), {255, 30, 30, 255}, ph ? 10.f : 0.3f);
+            drawM(mCube, local(b, c.yaw, {0.3f, 1.55f, -0.1f}, {0.5f, 0.12f, 0.22f}), {30, 60, 255, 255}, ph ? 0.3f : 10.f);
+        }
+        return;
+    }
     drawM(c.type == 1 ? mCarSport : mCarBody, local(b, c.yaw, {0, 0, 0}, {1, 1, 1}), body, 0, 0.2f, 4);
     if (c.police) drawM(mCube, local(b, c.yaw, {0, 0.66f, 0.1f}, {W * 0.995f, 0.28f, 1.9f}), {15, 15, 20, 255}, 0, 0.25f);
     for (int i = 0; i < 4; i++) {
@@ -434,7 +511,12 @@ static void drawCar(const Car& c, float t, float night) {
     }
 }
 
-static void drawHuman(Vector3 p, float yaw, float phase, float moving, Color shirt, Color pants, Color skin) {
+static void drawHuman(Vector3 p, float yaw, float phase, float moving, Color shirt, Color pants, Color skin, Ext* ex = nullptr, bool animate = true) {
+    if (ex && ex->ok) {
+        int anim = moving > 0.3f ? (ex->walk >= 0 ? ex->walk : ex->idle) : (ex->idle >= 0 ? ex->idle : -1);
+        drawExt(*ex, TRS(p, yaw, {1, 1, 1}), animate ? anim : -1, phase / 5.f, 0.6f);
+        return;
+    }
     float sw = sinf(phase) * 0.55f * moving, bob = fabsf(sinf(phase)) * 0.045f * moving;
     Vector3 b = {p.x, p.y + bob, p.z};
     Color hair = {35, 24, 18, 255};
@@ -576,6 +658,7 @@ int main() {
     mRim = LoadModelFromMesh(GenMeshCylinder(0.25f, 0.27f, 20));
     Model* all[] = {&mCube, &mCyl, &mSphere, &mPlane, &mCarBody, &mCarSport, &mFrond, &mRim};
     LoadMaterials();
+    LoadExternalModels();
     const char* tnames[] = {"tAsphD", "tPaveD", "tSandD", "tWallD", "tAsphN", "tPaveN", "tSandN", "tWallN"};
     for (int i = 0; i < 8; i++) { int sl = 1 + i; SetShaderValue(lit, GetShaderLocation(lit, tnames[i]), &sl, SHADER_UNIFORM_INT); }
     mSky.materials[0].shader = sky;
@@ -856,6 +939,7 @@ int main() {
             }
             for (auto& p : palms) {
                 if (Vector2Distance({p.pos.x, p.pos.z}, {focusPt.x, focusPt.z}) > cullR) continue;
+                if (extPalm.ok) { drawExt(extPalm, TRS(p.pos, p.pos.x, {p.h / 10.f, p.h / 10.f, p.h / 10.f}), -1, 0, 0.7f); continue; }
                 Matrix lean = MatrixRotateZ(p.lean);
                 for (int s = 0; s < 14; s++) {
                     float y0 = p.h * (s + 0.5f) / 14.f, rr = 0.26f - s * 0.006f;
@@ -876,9 +960,10 @@ int main() {
             for (auto& p : peds) {
                 if (Vector3Distance(p.pos, focusPt) > 200) continue;
                 if (p.dead) { drawM(mCube, TRS({p.pos.x, 0.3f, p.pos.z}, p.yaw, {0.5f, 0.3f, 1.7f}), p.shirt, 0, 0.8f); continue; }
-                drawHuman(p.pos, p.yaw, p.phase, 1, p.shirt, {50, 60, 80, 255}, {200, 150, 115, 255});
+                drawHuman(p.pos, p.yaw, p.phase, 1, p.shirt, {50, 60, 80, 255}, {200, 150, 115, 255},
+                          extPeds.empty() ? nullptr : &extPeds[(&p - &peds[0]) % extPeds.size()], Vector3Distance(p.pos, focusPt) < 45);
             }
-            if (!inCar && screen != TITLE) drawHuman(player, pyaw, walkPhase, moving, {240, 240, 235, 255}, {40, 45, 60, 255}, {190, 140, 105, 255});
+            if (!inCar && screen != TITLE) drawHuman(player, pyaw, walkPhase, moving, {240, 240, 235, 255}, {40, 45, 60, 255}, {190, 140, 105, 255}, extPlayer.ok ? &extPlayer : nullptr);
         };
 
         // =============================== Sombra ===============================
@@ -888,6 +973,7 @@ int main() {
             Vector3 c = screen == TITLE ? Vector3{0, 0, 0} : Vector3{cam.target.x, 0, cam.target.z};
             lc.target = c; lc.position = Vector3Add(c, Vector3Scale(lightDir, 400));
             for (Model* m : all) m->materials[0].shader = depth;
+            SetExtShader(depth);
             shadowPass = true;
             BeginTextureMode(shadowMap);
             ClearBackground(WHITE);
@@ -899,6 +985,7 @@ int main() {
             EndTextureMode();
             shadowPass = false;
             for (Model* m : all) m->materials[0].shader = lit;
+            SetExtShader(lit);
         } else sOn = 0, SetShaderValue(lit, lShOn, &sOn, SHADER_UNIFORM_INT);
         SetShaderValueMatrix(lit, lLVP, lightVP);
         for (Model* m : all) m->materials[0].shader = lit;

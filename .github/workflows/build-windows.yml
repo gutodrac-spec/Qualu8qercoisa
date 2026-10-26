@@ -10,9 +10,15 @@ jobs:
       - name: Download photoreal CC0 textures (Poly Haven)
         run: python game/tools/fetch_assets.py build/Release/assets
         continue-on-error: true
+      - name: Copy 3D models
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/Release/models | Out-Null
+          Copy-Item game/models/* build/Release/models/ -Recurse -Exclude LEIA-ME.md
       - uses: actions/upload-artifact@v4
         with:
           name: NeonCoast-Windows
           path: |
             build/Release/NeonCoast.exe
             build/Release/assets/
+            build/Release/models/
