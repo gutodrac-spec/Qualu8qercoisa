@@ -9,7 +9,7 @@ IDS = {   # id -> resolução
     "street_lamp_01": "1k", "street_lamp_02": "1k", "fire_hydrant": "1k", "utility_box_01": "1k", "utility_box_02": "1k",
     "concrete_road_barrier": "1k", "modular_street_seating": "1k", "trashbag": "1k", "water_manhole_cover": "1k",
     "modular_electricity_poles": "1k", "security_light": "1k", "standing_chalkboard_01": "1k", "outdoor_table_chair_set_01": "1k",
-    "island_tree_01": "1k", "island_tree_02": "1k", "island_tree_03": "1k", "jacaranda_tree": "1k", "tree_small_02": "1k",
+    "island_tree_02": "1k",
     "shrub_04": "1k", "potted_plant_01": "1k", "potted_plant_02": "1k", "coast_rocks_01": "1k", "barrel_03": "1k", "covered_car": "1k",
 }
 

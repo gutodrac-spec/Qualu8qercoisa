@@ -8,15 +8,18 @@
 #include <utility>
 #include <cstring>
 #include <string>
+#include <map>
+#include <type_traits>
 
 // =====================================================================================
 // Shaders
 // =====================================================================================
 static const char* LIT_VS = R"(#version 330
-in vec3 vertexPosition; in vec3 vertexNormal; in vec4 vertexColor; in vec2 vertexTexCoord;
+in vec3 vertexPosition; in vec3 vertexNormal; in vec4 vertexColor; in vec2 vertexTexCoord; in vec4 vertexTangent;
 uniform mat4 mvp; uniform mat4 matModel; uniform mat4 matNormal;
-out vec3 fragPos; out vec3 fragNormal; out vec4 vcol; out vec2 uv0;
+out vec3 fragPos; out vec3 fragNormal; out vec4 vcol; out vec2 uv0; out vec4 tang;
 void main(){
+    tang = vec4((matModel*vec4(vertexTangent.xyz,0.0)).xyz, vertexTangent.w);
     uv0 = vertexTexCoord;
     fragPos = (matModel*vec4(vertexPosition,1.0)).xyz;
     fragNormal = normalize((matNormal*vec4(vertexNormal,0.0)).xyz);
@@ -25,11 +28,11 @@ void main(){
 })";
 
 static const char* LIT_FS = R"(#version 330
-in vec3 fragPos; in vec3 fragNormal; in vec4 vcol; in vec2 uv0;
-uniform vec4 colDiffuse; uniform sampler2D texture0;
+in vec3 fragPos; in vec3 fragNormal; in vec4 vcol; in vec2 uv0; in vec4 tang;
+uniform vec4 colDiffuse; uniform sampler2D texture0, texture1, texture2; uniform int usePBR;
 uniform vec3 lightDir, lightColor, ambSky, ambGround, viewPos, fogColor;
 uniform float fogDensity, night, time, emissive, roughness;
-uniform int surface;            // 0 generico, 1 terreno, 2 fachada, 3 calcada, 4 pintura automotiva
+uniform int surface;            // 0 generico, 1 terreno, 2 fachada, 3 calcada, 4 pintura automotiva, 5 vidro de janela
 uniform mat4 lightVP; uniform sampler2D shadowMap; uniform int shadowsOn;
 uniform float blockP, roadW, beachX, waterX;
 uniform vec3 headPos, headDir; uniform float headOn;
@@ -76,7 +79,22 @@ void main(){
     bool water = false;
     vec3 Tx = vec3(1,0,0), Tz = vec3(0,0,1), Ty = vec3(0,1,0);
 
-    if (surface==4){
+    if (usePBR==1){   // materiais fotogramétricos: normal map + ARM (oclusão, rugosidade, metal)
+        vec3 arm = texture(texture1, uv0).rgb;
+        ao = arm.r; rough = clamp(arm.g, 0.04, 1.0); metal = arm.b;
+        if (length(tang.xyz) > 0.5){
+            vec3 T = normalize(tang.xyz - n*dot(n, tang.xyz)), B = cross(n, T)*(tang.w < 0.0 ? -1.0 : 1.0);
+            vec3 m = texture(texture2, uv0).rgb*2.0-1.0;
+            n = normalize(T*m.x + B*m.y + n*m.z);
+        }
+    }
+    if (surface==5){
+        vec2 cell = floor(vec2(dot(fragPos.xz, vec2(1.0)) / 3.0, fragPos.y / 3.0));
+        float r = hash(cell + 3.1);
+        albedo = mix(vec3(0.015,0.02,0.03), vec3(0.08,0.07,0.06), step(0.75, r)*0.6);
+        rough = 0.04; metal = 0.0; ao = 1.0;
+        emis += step(0.5, r) * night * mix(vec3(1.0,0.68,0.32), vec3(0.75,0.85,1.0), step(0.85,r)) * (1.2 + 0.8*hash(cell+7.0));
+    } else if (surface==4){
         if (vcol.a < 0.5){ albedo = vec3(0.01,0.012,0.016); rough = 0.02; metal = 0.0; }
         else { rough = 0.18; metal = 0.25; }
         ao = mix(0.55, 1.0, smoothstep(0.25, 0.75, fragPos.y));
@@ -190,7 +208,7 @@ void main(){
     float fog = 1.0 - exp(-pow(dist*fogDensity, 1.5));
     fog *= mix(1.0, 0.6, smoothstep(0.0, 80.0, fragPos.y));      // neblina por altura
     col = mix(col, fogColor, clamp(fog,0.0,1.0));
-    col = aces(col*1.15);
+    col = aces(col*0.95);
     finalColor = vec4(pow(col, vec3(1.0/2.2)), 1.0);
 })";
 
@@ -280,7 +298,7 @@ void main(){
 // =====================================================================================
 // Mundo
 // =====================================================================================
-struct Building { Vector3 pos, size; Color col; int style; Color neon; };
+struct Building { Vector3 pos, size; Color col; int style; Color neon; int kit = -1, floors = 0, winType = 0; };
 struct Palm { Vector3 pos; float h, lean; };
 struct Car { Vector3 pos; float yaw, speed; Color col; int type; bool police; float stun; };
 struct Ped { Vector3 pos; float yaw, speed, phase; Color shirt; bool dead; };
@@ -293,13 +311,13 @@ static const float BLOCK = 40.f, ROAD = 14.f, P = BLOCK + ROAD;
 static Model mCube, mCyl, mSphere, mPlane;
 static Shader lit, sky, depth, post;
 static bool shadowPass = false;
-static int locEmissive, locSurface, locRough;
+static int locEmissive, locSurface, locRough, locPBR;
 
 static void setUniF(int loc, float v) { SetShaderValue(lit, loc, &v, SHADER_UNIFORM_FLOAT); }
 static void setUniI(int loc, int v) { SetShaderValue(lit, loc, &v, SHADER_UNIFORM_INT); }
 
 static void drawM(Model& m, Matrix world, Color c, float emissive = 0, float rough = 0.6f, int surface = 0) {
-    if (!shadowPass) { setUniF(locEmissive, emissive); setUniF(locRough, rough); setUniI(locSurface, surface); }
+    if (!shadowPass) { setUniF(locEmissive, emissive); setUniF(locRough, rough); setUniI(locSurface, surface); setUniI(locPBR, 0); }
     m.transform = world;
     DrawModel(m, {0, 0, 0}, 1.f, c);
 }
@@ -414,7 +432,7 @@ static Mesh GenFrond() {
 // Modelos externos hiper-realistas (.glb/.gltf de Sketchfab, Fab, etc.) em models/
 // Se o arquivo existir ele substitui o modelo procedural correspondente.
 // =====================================================================================
-struct Ext { Model m = {0}; bool ok = false; Matrix fix = MatrixIdentity(); ModelAnimation* anims = nullptr; int animCount = 0, walk = -1, idle = -1, run = -1; };
+struct Ext { Model m = {0}; bool ok = false, pbr = false; Matrix fix = MatrixIdentity(); ModelAnimation* anims = nullptr; int animCount = 0, walk = -1, idle = -1, run = -1; };
 static Ext extPolice, extPlayer, extPalm;
 static std::vector<Ext> extCars, extPeds;
 
@@ -422,6 +440,8 @@ static Ext LoadExt(const char* name, float target, bool byLength) {
     Ext e;
     std::string dir = std::string(GetApplicationDirectory()) + "models/", path;
     for (const char* ext : {".glb", ".gltf"}) if (FileExists((dir + name + ext).c_str())) { path = dir + name + ext; break; }
+    for (const char* res : {"_1k.gltf", "_2k.gltf"})   // modelos do Poly Haven: models/polyhaven/<id>/<id>_1k.gltf
+        if (path.empty() && FileExists((dir + "polyhaven/" + name + "/" + name + res).c_str())) { path = dir + "polyhaven/" + name + "/" + name + res; e.pbr = true; }
     if (path.empty()) return e;
     e.m = LoadModel(path.c_str());
     if (e.m.meshCount == 0) return e;
@@ -451,6 +471,7 @@ static Ext LoadExt(const char* name, float target, bool byLength) {
     float ref = byLength ? fmaxf(sz.x, sz.z) : sz.y;
     float sc = target / fmaxf(ref, 0.001f);
     Vector3 c = {(bb.min.x + bb.max.x) / 2, bb.min.y, (bb.min.z + bb.max.z) / 2};
+    if (target <= 0) { sc = 1; c = {0, 0, 0}; yaw = 0; }   // tamanho real (objetos de cenário)
     e.fix = MatrixMultiply(MatrixMultiply(MatrixTranslate(-c.x, -c.y, -c.z), MatrixScale(sc, sc, sc)), MatrixRotateY(yaw));
     e.ok = true;
     TraceLog(LOG_INFO, "Modelo externo carregado: %s (%d animacoes)", path.c_str(), e.animCount);
@@ -466,6 +487,133 @@ static void LoadExternalModels() {
     extPalm = LoadExt("palm", 10.f, false);
 }
 
+
+// =====================================================================================
+// Kits modulares de fachada (Poly Haven "Hidden Alley"): prédios montados peça por peça
+// e fundidos numa malha por material. Só os prédios próximos ficam carregados.
+// =====================================================================================
+struct KitPiece { int first = 0, count = 0; Vector3 t = {0, 0, 0}; };
+struct Kit { Model m = {0}; bool ok = false; std::map<std::string, KitPiece> pieces; std::vector<std::string> matName; };
+static Kit kits[2];   // 0 = apartamentos (reboco), 1 = fábrica (tijolo)
+
+static Kit LoadKit(const char* id) {
+    Kit k;
+    std::string base = std::string(GetApplicationDirectory()) + "models/polyhaven/" + id + "/" + id + "_1k";
+    if (!FileExists((base + ".gltf").c_str()) || !FileExists((base + ".kit").c_str())) return k;
+    k.m = LoadModel((base + ".gltf").c_str());
+    if (k.m.meshCount == 0) return k;
+    k.matName.resize(k.m.materialCount);
+    char* txt = LoadFileText((base + ".kit").c_str());
+    std::string all(txt); UnloadFileText(txt);
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t e = all.find('\n', pos); if (e == std::string::npos) e = all.size();
+        std::string line = all.substr(pos, e - pos); pos = e + 1;
+        char kind[16], name[128]; int a, b; float x, y, z;
+        if (sscanf(line.c_str(), "piece %127s %d %d %f %f %f", name, &a, &b, &x, &y, &z) == 6) k.pieces[name] = {a, b, {x, y, z}};
+        else if (sscanf(line.c_str(), "%15s %d %127s", kind, &a, name) == 3 && std::string(kind) == "mat" && a < k.m.materialCount) k.matName[a] = name;
+    }
+    for (int i = 0; i < k.m.materialCount; i++) k.m.materials[i].shader = lit;
+    k.ok = !k.pieces.empty();
+    TraceLog(LOG_INFO, "Kit modular: %s (%d pecas)", id, (int)k.pieces.size());
+    return k;
+}
+
+struct KitChunk { Mesh mesh; int mat; };
+struct KitBuilding { std::vector<KitChunk> chunks; };
+
+struct MeshAcc {   // acumula vértices de um material, quebrando em blocos de até 60k vértices (índices de 16 bits)
+    std::vector<float> v, n, t, tg; std::vector<unsigned short> idx; std::vector<KitChunk>* out; int mat;
+    void flush() {
+        if (idx.empty()) return;
+        Mesh m = {0};
+        m.vertexCount = (int)v.size() / 3; m.triangleCount = (int)idx.size() / 3;
+        auto cp = [](auto& src) { auto* d = (std::remove_reference_t<decltype(src[0])>*)MemAlloc((unsigned)(src.size() * sizeof(src[0]))); memcpy(d, src.data(), src.size() * sizeof(src[0])); return d; };
+        m.vertices = cp(v); m.normals = cp(n); m.texcoords = cp(t); m.tangents = cp(tg); m.indices = cp(idx);
+        UploadMesh(&m, false);
+        out->push_back({m, mat});
+        v.clear(); n.clear(); t.clear(); tg.clear(); idx.clear();
+    }
+    void add(const Mesh& src, Matrix M, Vector3 off) {
+        if (v.size() / 3 + src.vertexCount > 60000) flush();
+        unsigned short base = (unsigned short)(v.size() / 3);
+        for (int i = 0; i < src.vertexCount; i++) {
+            Vector3 p = Vector3Transform({src.vertices[i * 3] - off.x, src.vertices[i * 3 + 1] - off.y, src.vertices[i * 3 + 2] - off.z}, M);
+            v.insert(v.end(), {p.x, p.y, p.z});
+            Vector3 nn = src.normals ? Vector3{src.normals[i * 3], src.normals[i * 3 + 1], src.normals[i * 3 + 2]} : Vector3{0, 0, 1};
+            nn = Vector3Normalize(Vector3Subtract(Vector3Transform(nn, M), Vector3Transform({0, 0, 0}, M)));
+            n.insert(n.end(), {nn.x, nn.y, nn.z});
+            t.insert(t.end(), {src.texcoords ? src.texcoords[i * 2] : 0.f, src.texcoords ? src.texcoords[i * 2 + 1] : 0.f});
+            Vector3 tt = src.tangents ? Vector3{src.tangents[i * 4], src.tangents[i * 4 + 1], src.tangents[i * 4 + 2]} : Vector3{1, 0, 0};
+            tt = Vector3Subtract(Vector3Transform(tt, M), Vector3Transform({0, 0, 0}, M));
+            tg.insert(tg.end(), {tt.x, tt.y, tt.z, src.tangents ? src.tangents[i * 4 + 3] : 1.f});
+        }
+        if (src.indices) for (int i = 0; i < src.triangleCount * 3; i++) idx.push_back(base + src.indices[i]);
+        else for (int i = 0; i < src.vertexCount; i++) idx.push_back(base + i);
+    }
+};
+
+static bool KitAdd(Kit& k, std::map<int, MeshAcc>& acc, std::vector<KitChunk>& out, const std::string& name, Matrix M) {
+    auto it = k.pieces.find(name);
+    if (it == k.pieces.end()) return false;
+    for (int i = 0; i < it->second.count; i++) {
+        int mi = it->second.first + i;
+        if (mi >= k.m.meshCount) break;
+        int mat = k.m.meshMaterial[mi];
+        MeshAcc& a = acc[mat]; a.out = &out; a.mat = mat;
+        a.add(k.m.meshes[mi], M, it->second.t);
+    }
+    return true;
+}
+
+enum PropType { PR_LAMP, PR_LAMP2, PR_HYDRANT, PR_UBOX, PR_UBOX2, PR_TRASH, PR_POT, PR_POT2, PR_TREE, PR_CHALK, PR_TABLE, PR_CCAR, PR_MANHOLE, PR_ROCK, PR_BARRIER, PR_BARREL, PR_COUNT };
+static const char* PROP_IDS[PR_COUNT] = {"street_lamp_01", "street_lamp_02", "fire_hydrant", "utility_box_01", "utility_box_02", "trashbag", "potted_plant_01", "potted_plant_02",
+    "island_tree_02", "standing_chalkboard_01", "outdoor_table_chair_set_01", "covered_car", "water_manhole_cover", "coast_rocks_01", "concrete_road_barrier", "barrel_03"};
+static Ext propModels[PR_COUNT];
+struct Prop { int type; Vector3 pos; float yaw; };
+
+static KitBuilding BuildKitBuilding(const Building& b) {
+    KitBuilding kb;
+    Kit& k = kits[b.kit];
+    std::map<int, MeshAcc> acc;
+    static const char* aptWin[] = {"window_centered_large_02", "window_centered_double_02", "window_offset_small_03", "window_centered_small_02", "window_centered_large_01", "window_centered_double_01"};
+    static const char* facWin[] = {"window_centered_large_01", "window_centered_medium_01", "window_tall_large_01", "window_centered_double_01", "window_tall_small_01"};
+    bool apt = b.kit == 0;
+    float W = b.size.x, D = b.size.z;
+    struct Side { float yaw, L; Vector3 c; } sides[4] = {
+        {0, W, {b.pos.x, 0, b.pos.z + D / 2}}, {PI, W, {b.pos.x, 0, b.pos.z - D / 2}},
+        {PI / 2, D, {b.pos.x + W / 2, 0, b.pos.z}}, {-PI / 2, D, {b.pos.x - W / 2, 0, b.pos.z}}};
+    unsigned seed = (unsigned)(b.pos.x * 7 + b.pos.z * 13);
+    for (int si = 0; si < 4; si++) {
+        Side& sd = sides[si];
+        int n = (int)roundf(sd.L / 3);
+        Matrix place = MatrixMultiply(MatrixRotateY(sd.yaw), MatrixTranslate(sd.c.x, 0, sd.c.z));
+        auto at = [&](float lx, float y) { return MatrixMultiply(MatrixTranslate(lx, y, 0), place); };
+        for (int i = 0; i < n; i++) {
+            float lx = -sd.L / 2 + 3 * (i + 1);
+            for (int f = 0; f < b.floors; f++) {
+                float y = f * 3.f;
+                std::string piece;
+                if (f == 0) piece = (si == 0 && i == n / 2) ? "door_centered_large_01" : (apt ? "door_window_small_01" : "window_tall_large_01");
+                else {
+                    int wt = b.winType;
+                    if (((seed >> (f % 8)) + i * 7 + si) % 11 == 0) wt = (wt + 1) % (apt ? 6 : 5);   // variação ocasional
+                    piece = apt ? aptWin[wt] : facWin[wt % 5];
+                }
+                if (!KitAdd(k, acc, kb.chunks, "wall_" + piece, at(lx, y))) KitAdd(k, acc, kb.chunks, "wall_standard_standard_01", at(lx, y));
+                KitAdd(k, acc, kb.chunks, piece, at(lx, y));
+            }
+            KitAdd(k, acc, kb.chunks, "dado_standard_standard_01", at(lx, 0));
+            KitAdd(k, acc, kb.chunks, apt ? "cornice_standard_standard_01" : "cornice02_standard_standard_01", at(lx, 3.f));
+            if (apt) KitAdd(k, acc, kb.chunks, "crown_standard_standard_01", at(lx, b.floors * 3.f));
+            else KitAdd(k, acc, kb.chunks, "cornice02_standard_standard_01", at(lx, b.floors * 3.f - 0.2f));
+        }
+        for (int f = 0; f < b.floors; f++) KitAdd(k, acc, kb.chunks, "wall_pier_corner_01", at(sd.L / 2, f * 3.f));
+    }
+    for (auto& [mat, a] : acc) a.flush();
+    return kb;
+}
+
 static void SetExtShader(Shader s) {
     auto set = [&](Ext& e) { if (e.ok) for (int i = 0; i < e.m.materialCount; i++) e.m.materials[i].shader = s; };
     set(extPolice); set(extPlayer); set(extPalm);
@@ -476,7 +624,7 @@ static void SetExtShader(Shader s) {
 static void drawExt(Ext& e, Matrix world, int anim = -1, float animTime = 0, float rough = 0.5f) {
     if (anim >= 0 && anim < e.animCount && e.anims[anim].frameCount > 0)
         UpdateModelAnimation(e.m, e.anims[anim], (int)(animTime * 30) % e.anims[anim].frameCount);
-    if (!shadowPass) { setUniF(locEmissive, 0); setUniF(locRough, rough); setUniI(locSurface, 0); }
+    if (!shadowPass) { setUniF(locEmissive, 0); setUniF(locRough, rough); setUniI(locSurface, 0); setUniI(locPBR, e.pbr ? 1 : 0); }
     e.m.transform = MatrixMultiply(e.fix, world);
     DrawModel(e.m, {0, 0, 0}, 1.f, WHITE);
 }
@@ -640,6 +788,7 @@ int main() {
     locEmissive = GetShaderLocation(lit, "emissive");
     locSurface = GetShaderLocation(lit, "surface");
     locRough = GetShaderLocation(lit, "roughness");
+    locPBR = GetShaderLocation(lit, "usePBR");
     auto L = [&](const char* n) { return GetShaderLocation(lit, n); };
     int lLightDir = L("lightDir"), lLightCol = L("lightColor"), lAmbS = L("ambSky"), lAmbG = L("ambGround"), lView = L("viewPos"),
         lFog = L("fogColor"), lFogD = L("fogDensity"), lNight = L("night"), lTime = L("time"), lLVP = L("lightVP"), lShadow = L("shadowMap"),
@@ -666,8 +815,11 @@ int main() {
     Model* all[] = {&mCube, &mCyl, &mSphere, &mPlane, &mCarBody, &mCarSport, &mFrond, &mRim};
     LoadMaterials();
     LoadExternalModels();
+    for (int i = 0; i < PR_COUNT; i++) propModels[i] = LoadExt(PROP_IDS[i], 0, false);
+    kits[0] = LoadKit("modular_urban_apartments_facade");
+    kits[1] = LoadKit("modular_factory_facade");
     const char* tnames[] = {"tAsphD", "tPaveD", "tSandD", "tWallD", "tAsphN", "tPaveN", "tSandN", "tWallN"};
-    for (int i = 0; i < 8; i++) { int sl = 1 + i; SetShaderValue(lit, GetShaderLocation(lit, tnames[i]), &sl, SHADER_UNIFORM_INT); }
+    for (int i = 0; i < 8; i++) { int sl = 7 + i; SetShaderValue(lit, GetShaderLocation(lit, tnames[i]), &sl, SHADER_UNIFORM_INT); }
     mSky.materials[0].shader = sky;
     RenderTexture2D shadowMap = LoadShadowmap(4096);
 
@@ -688,9 +840,49 @@ int main() {
             float h = downtown ? frand(50, 170) / (1 + dc * 0.25f) + 20 : frand(7, 28);
             Vector3 pos = {cx - BLOCK / 2 + (i + 0.5f) * BLOCK / nx, h / 2, cz - BLOCK / 2 + (j + 0.5f) * BLOCK / nz};
             Color neons[] = {{255, 40, 160, 255}, {40, 230, 255, 255}, {255, 140, 30, 255}, {150, 60, 255, 255}};
-            buildings.push_back({pos, {w, h, d}, downtown && rand() % 2 ? Color{180, 195, 205, 255} : pastel[rand() % 7], downtown ? 0 : 1 + rand() % 2, neons[rand() % 4]});
+            Building nb = {pos, {w, h, d}, downtown && rand() % 2 ? Color{180, 195, 205, 255} : pastel[rand() % 7], downtown ? 0 : 1 + rand() % 2, neons[rand() % 4]};
+            if (!downtown) {   // grade de 3 m para os kits modulares
+                nb.size.x = fmaxf(6, floorf(w / 3) * 3); nb.size.z = fmaxf(6, floorf(d / 3) * 3);
+                nb.floors = (int)Clamp(roundf(h / 3), 2, 6); nb.size.y = nb.floors * 3.f; nb.pos.y = nb.size.y / 2;
+                int want = rand() % 10 < 7 ? 0 : 1;
+                nb.kit = kits[want].ok ? want : (kits[1 - want].ok ? 1 - want : -1);
+                nb.winType = rand() % 6;
+            }
+            buildings.push_back(nb);
         }
         if (!downtown) palms.push_back({{cx + BLOCK / 2 - 1.5f, 0.15f, cz + frand(-BLOCK / 2, BLOCK / 2)}, frand(8, 12), frand(-0.1f, 0.1f)});
+    }
+    std::vector<KitBuilding*> kitCache(buildings.size(), nullptr);
+    // ---------- objetos de rua ----------
+    std::vector<Prop> props;
+    for (int x = -GRID / 2; x < GRID / 2; x++) for (int z = -GRID / 2; z < GRID / 2; z++) {
+        float cx = x * P, cz = z * P, e = BLOCK / 2 - 0.9f;
+        if (cx > beachX - P / 2) {
+            if (cx < waterX) for (int i = 0; i < 2; i++) props.push_back({PR_ROCK, {waterX - frand(2, 12), 0, cz + frand(-20, 20)}, frand(0, 6.28f)});
+            continue;
+        }
+        for (int sd = 0; sd < 4; sd++) {   // 4 lados da quadra; yaw aponta para a rua
+            float yaw = sd * PI / 2;
+            Vector3 out = {sinf(yaw), 0, cosf(yaw)}, along = {cosf(yaw), 0, -sinf(yaw)};
+            auto at = [&](float a, float o) { return Vector3{cx + out.x * o + along.x * a, 0.15f, cz + out.z * o + along.z * a}; };
+            for (float a = -13; a <= 13; a += 13) props.push_back({a == 0 ? PR_TREE : PR_LAMP, at(a, e), yaw});
+            if (rand() % 2) props.push_back({rand() % 2 ? PR_UBOX : PR_UBOX2, at(frand(-17, 17), e - 0.2f), yaw + PI});
+            if (rand() % 3 == 0) props.push_back({PR_BARREL, at(frand(-17, 17), e - 1.f), frand(0, 6.28f)});
+            if (rand() % 7 == 0) props.push_back({PR_CCAR, Vector3{cx + out.x * (BLOCK / 2 + 1.6f) + along.x * frand(-12, 12), 0, cz + out.z * (BLOCK / 2 + 1.6f) + along.z * frand(-12, 12)}, yaw + PI / 2});
+        }
+        props.push_back({PR_HYDRANT, {cx + BLOCK / 2 - 1.2f, 0.15f, cz + BLOCK / 2 - 4.f}, 0});
+        props.push_back({PR_MANHOLE, {cx + P / 2 + 2.f, 0.01f, cz + P / 2 - 2.f}, 0});
+        for (int i = 0; i < 3; i++) props.push_back({PR_TRASH, {cx + frand(-e, e), 0.15f, cz + (rand() % 2 ? e : -e) * 0.97f}, frand(0, 6.28f)});
+    }
+    for (auto& b : buildings) {
+        if (b.kit < 0) continue;
+        Vector3 door = {b.pos.x, 0.15f, b.pos.z + b.size.z / 2 + 0.7f};
+        props.push_back({rand() % 2 ? PR_POT : PR_POT2, {door.x - 2.f, 0.15f, door.z}, 0});
+        props.push_back({rand() % 2 ? PR_POT : PR_POT2, {door.x + 2.f, 0.15f, door.z}, 0});
+        if (b.style == 2 && b.kit == 0) {
+            props.push_back({PR_CHALK, {door.x + 3.5f, 0.15f, door.z + 0.3f}, 0.3f});
+            props.push_back({PR_TABLE, {door.x - 4.5f, 0.15f, door.z + 0.4f}, 0});
+        }
     }
     auto spawnCar = [&](bool police) {
         bool alongX = rand() % 2; int k = rand() % GRID - GRID / 2;
@@ -871,6 +1063,21 @@ int main() {
             if (shake > 0) { shake -= dt; cam.position = Vector3Add(cam.position, {frand(-1, 1) * shake * 0.3f, frand(-1, 1) * shake * 0.3f, 0}); }
         }
 
+        // ---------- streaming dos prédios modulares (1 por quadro, os mais próximos primeiro) ----------
+        {
+            Vector3 fp = screen == TITLE ? Vector3{0, 0, 0} : player;
+            int best = -1; float bd = 1e9f;
+            for (size_t i = 0; i < buildings.size(); i++) {
+                if (buildings[i].kit < 0) continue;
+                float d = Vector2Distance({buildings[i].pos.x, buildings[i].pos.z}, {fp.x, fp.z});
+                if (kitCache[i] && d > 230) {
+                    for (auto& ch : kitCache[i]->chunks) UnloadMesh(ch.mesh);
+                    delete kitCache[i]; kitCache[i] = nullptr;
+                } else if (!kitCache[i] && d < 160 && d < bd) { bd = d; best = (int)i; }
+            }
+            if (best >= 0) kitCache[best] = new KitBuilding(BuildKitBuilding(buildings[best]));
+        }
+
         // =============================== Iluminação ===============================
         float sunA = (timeOfDay - 6) / 12 * PI;
         Vector3 sunDir = Vector3Normalize({cosf(sunA) * 0.85f, sinf(sunA), 0.4f});
@@ -878,7 +1085,7 @@ int main() {
         float day = Clamp(sunH * 4 + 0.2f, 0, 1), dusk = Clamp(1 - fabsf(sunH) * 4, 0, 1);
         float night = 1 - Clamp(sunH * 6 + 0.5f, 0, 1);
         Vector3 lightDir = sunH > -0.05f ? sunDir : Vector3Normalize({-sunDir.x, -sunDir.y, 0.4f});
-        Vector3 sunCol = Vector3Lerp({3.2f, 1.3f, 0.55f}, {3.0f, 2.85f, 2.6f}, Clamp(sunH * 3, 0, 1));
+        Vector3 sunCol = Vector3Lerp({2.8f, 1.15f, 0.5f}, {2.3f, 2.2f, 2.0f}, Clamp(sunH * 3, 0, 1));
         Vector3 lightCol = sunH > -0.05f ? Vector3Scale(sunCol, Clamp(sunH * 8, 0, 1)) : Vector3{0.18f, 0.22f, 0.4f};
         Vector3 zen = Vector3Lerp({0.01f, 0.015f, 0.05f}, {0.12f, 0.32f, 0.75f}, day);
         Vector3 hor = Vector3Lerp(Vector3Lerp({0.04f, 0.04f, 0.09f}, {0.65f, 0.8f, 0.95f}, day), {1.1f, 0.45f, 0.3f}, dusk * 0.8f);
@@ -924,8 +1131,28 @@ int main() {
                 drawM(mCube, TRS({lp.x, 4, lp.z}, 0, {0.18f, 8, 0.18f}), {50, 52, 55, 255}, 0, 0.4f);
                 drawM(mCube, TRS({cx + P / 2 + 4.f, 7.4f, cz + P / 2 + 4.f}, 0, {0.6f, 0.15f, 0.6f}), {255, 220, 170, 255}, night * 6, 0.2f);
             }
-            for (auto& b : buildings) {
+            for (size_t bi = 0; bi < buildings.size(); bi++) {
+                Building& b = buildings[bi];
                 if (Vector2Distance({b.pos.x, b.pos.z}, {focusPt.x, focusPt.z}) > cullR + 80) continue;
+                KitBuilding* kb = kitCache[bi];
+                if (kb && !shadowPass) {
+                    Kit& k = kits[b.kit];
+                    drawM(mCube, TRS(b.pos, 0, {b.size.x - 0.7f, b.size.y, b.size.z - 0.7f}), {40, 38, 36, 255}, 0, 0.9f);
+                    drawM(mCube, TRS({b.pos.x, b.size.y + 0.02f, b.pos.z}, 0, {b.size.x - 0.2f, 0.1f, b.size.z - 0.2f}), {120, 118, 112, 255}, 0, 0.95f, 3);
+                    for (auto& ch : kb->chunks) {
+                        const std::string& mn = k.matName[ch.mat];
+                        bool glass = mn.find("glass") != std::string::npos;
+                        setUniF(locEmissive, 0); setUniF(locRough, 0.6f); setUniI(locSurface, glass ? 5 : 0); setUniI(locPBR, glass ? 0 : 1);
+                        Material mat = k.m.materials[ch.mat];
+                        if (mn.find("plaster") != std::string::npos) mat.maps[MATERIAL_MAP_ALBEDO].color = b.col;   // reboco pintado em tons pastel
+                        DrawMesh(ch.mesh, mat, MatrixIdentity());
+                    }
+                    if (b.style > 0) {
+                        float sw = fminf(b.size.x * 0.5f, 8.f);
+                        drawM(mCube, TRS({b.pos.x, b.size.y - 1.2f, b.pos.z + b.size.z / 2 + 0.45f}, 0, {sw, 0.35f, 0.12f}), b.neon, 0.4f + night * 9, 0.3f);
+                    }
+                    continue;
+                }
                 drawM(mCube, TRS(b.pos, 0, b.size), b.col, 0, 0.75f, 2);
                 drawM(mCube, TRS({b.pos.x, b.size.y + 0.4f, b.pos.z}, 0, {b.size.x + 0.4f, 0.8f, b.size.z + 0.4f}), {225, 222, 215, 255}, 0, 0.8f);
                 if (b.size.y > 40) drawM(mCube, TRS({b.pos.x, b.size.y + 3.f, b.pos.z}, 0, {b.size.x * 0.4f, 5, b.size.z * 0.4f}), {120, 125, 130, 255}, 0, 0.5f);
@@ -943,6 +1170,13 @@ int main() {
                 } else {
                     for (int k = 0; k < 3; k++) drawM(mCube, TRS({b.pos.x + (k - 1) * b.size.x * 0.25f, b.size.y + 1.2f, b.pos.z - b.size.z * 0.25f}, 0, {2.2f, 1.6f, 2.2f}), {150, 152, 155, 255}, 0, 0.5f);
                 }
+            }
+            for (auto& pr : props) {
+                Ext& pm = propModels[pr.type];
+                if (!pm.ok) continue;
+                float d = Vector2Distance({pr.pos.x, pr.pos.z}, {focusPt.x, focusPt.z});
+                if (d > (pr.type == PR_TREE ? 170.f : 100.f) || (shadowPass && d > 70)) continue;
+                drawExt(pm, TRS(pr.pos, pr.yaw, {1, 1, 1}), -1, 0, 0.6f);
             }
             for (auto& p : palms) {
                 if (Vector2Distance({p.pos.x, p.pos.z}, {focusPt.x, focusPt.z}) > cullR) continue;
@@ -1007,8 +1241,8 @@ int main() {
         DrawModel(mSky, {0, 0, 0}, 1, WHITE);
         rlEnableDepthMask(); rlEnableBackfaceCulling();
         rlDrawRenderBatchActive();
-        int slot = 10; rlActiveTextureSlot(slot); rlEnableTexture(shadowMap.depth.id);
-        for (int i = 0; i < 4; i++) { rlActiveTextureSlot(1 + i); rlEnableTexture(texD[i].id); rlActiveTextureSlot(5 + i); rlEnableTexture(texN[i].id); }
+        int slot = 15; rlActiveTextureSlot(slot); rlEnableTexture(shadowMap.depth.id);
+        for (int i = 0; i < 4; i++) { rlActiveTextureSlot(7 + i); rlEnableTexture(texD[i].id); rlActiveTextureSlot(11 + i); rlEnableTexture(texN[i].id); }
         rlActiveTextureSlot(0);
         SetShaderValue(lit, lShadow, &slot, SHADER_UNIFORM_INT);
         drawWorld();

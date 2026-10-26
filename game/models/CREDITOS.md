@@ -11,3 +11,8 @@
   Animações Walk/Idle transferidas do "Soldier" (Mixamo).
 
 Os esqueletos foram ajustados para a raylib com `tools/fix_skin.py`.
+
+## Cenário (baixado no build)
+Prédios (kits modulares "modular_urban_apartments_facade" e "modular_factory_facade"), postes, hidrantes,
+caixas de energia, lixo, vasos, árvore, lousa, mesas, carro coberto, bueiro, pedras, barreira e barril:
+**Poly Haven** (https://polyhaven.com) — licença **CC0** (domínio público). Baixados por `tools/fetch_models.py`.

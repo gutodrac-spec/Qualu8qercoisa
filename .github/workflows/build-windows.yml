@@ -16,6 +16,8 @@ jobs:
           New-Item -ItemType Directory -Force build/Release/models | Out-Null
           Copy-Item game/models/* build/Release/models/ -Recurse -Exclude *.md
           pip install numpy
+          python game/tools/fetch_models.py build/Release/models/polyhaven
+          python game/tools/kit_manifest.py (Get-ChildItem build/Release/models/polyhaven/modular_*facade/*.gltf).FullName
           Get-ChildItem build/Release/models/*.glb | ForEach-Object { python game/tools/fix_skin.py $_.FullName }
       - uses: actions/upload-artifact@v4
         with:
