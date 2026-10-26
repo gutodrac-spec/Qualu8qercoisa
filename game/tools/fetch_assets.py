@@ -31,3 +31,14 @@ for mat, keys in WANT.items():
             break
         except Exception as e:
             print(f"{mat}: falhou {aid}: {e}")
+
+# ---------------------------------------------------------------------------------------
+# Catálogo de modelos 3D do Poly Haven (impresso no log do build) e download dos escolhidos
+# ---------------------------------------------------------------------------------------
+try:
+    models = json.loads(get("https://api.polyhaven.com/assets?t=models"))
+    print("=== CATALOGO POLY HAVEN (modelos) ===")
+    for mid, a in sorted(models.items()):
+        print(f"{mid} | {','.join(a.get('categories', []))} | {','.join(a.get('tags', [])[:6])}")
+except Exception as e:
+    print("catalogo falhou:", e)
