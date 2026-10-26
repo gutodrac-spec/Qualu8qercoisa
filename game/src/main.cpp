@@ -425,16 +425,6 @@ static Ext LoadExt(const char* name, float target, bool byLength) {
     if (path.empty()) return e;
     e.m = LoadModel(path.c_str());
     if (e.m.meshCount == 0) return e;
-    BoundingBox bb = GetModelBoundingBox(e.m);
-    Vector3 sz = Vector3Subtract(bb.max, bb.min);
-    float yaw = 0;
-    std::string yf = dir + name + ".yaw";   // arquivo opcional com a rotação em graus para alinhar a frente com +Z
-    if (FileExists(yf.c_str())) { char* s = LoadFileText(yf.c_str()); yaw = (float)atof(s) * DEG2RAD; UnloadFileText(s); }
-    else if (byLength && sz.x > sz.z) yaw = PI / 2;
-    float ref = byLength ? fmaxf(sz.x, sz.z) : sz.y;
-    float sc = target / fmaxf(ref, 0.001f);
-    Vector3 c = {(bb.min.x + bb.max.x) / 2, bb.min.y, (bb.min.z + bb.max.z) / 2};
-    e.fix = MatrixMultiply(MatrixMultiply(MatrixTranslate(-c.x, -c.y, -c.z), MatrixScale(sc, sc, sc)), MatrixRotateY(yaw));
     for (int i = 0; i < e.m.materialCount; i++) e.m.materials[i].shader = lit;
     e.anims = LoadModelAnimations(path.c_str(), &e.animCount);
     for (int i = 0; i < e.animCount; i++) {
@@ -445,6 +435,23 @@ static Ext LoadExt(const char* name, float target, bool byLength) {
         else if (n.find("idle") != std::string::npos && e.idle < 0) e.idle = i;
     }
     if (e.walk < 0 && e.animCount > 0 && IsModelAnimationValid(e.m, e.anims[0])) e.walk = 0;
+    // mede já na pose animada (esqueletos do Mixamo usam escala 0.01)
+    int ref0 = e.idle >= 0 ? e.idle : e.walk;
+    if (ref0 >= 0) UpdateModelAnimation(e.m, e.anims[ref0], 0);
+    BoundingBox bb = {{1e9f, 1e9f, 1e9f}, {-1e9f, -1e9f, -1e9f}};
+    for (int i = 0; i < e.m.meshCount; i++) {
+        Mesh& ms = e.m.meshes[i]; float* vv = (ref0 >= 0 && ms.animVertices) ? ms.animVertices : ms.vertices;
+        for (int k = 0; k < ms.vertexCount; k++) { Vector3 q = {vv[k * 3], vv[k * 3 + 1], vv[k * 3 + 2]}; bb.min = Vector3Min(bb.min, q); bb.max = Vector3Max(bb.max, q); }
+    }
+    Vector3 sz = Vector3Subtract(bb.max, bb.min);
+    float yaw = 0;
+    std::string yf = dir + name + ".yaw";   // arquivo opcional com a rotação em graus para alinhar a frente com +Z
+    if (FileExists(yf.c_str())) { char* s = LoadFileText(yf.c_str()); yaw = (float)atof(s) * DEG2RAD; UnloadFileText(s); }
+    else if (byLength && sz.x > sz.z) yaw = PI / 2;
+    float ref = byLength ? fmaxf(sz.x, sz.z) : sz.y;
+    float sc = target / fmaxf(ref, 0.001f);
+    Vector3 c = {(bb.min.x + bb.max.x) / 2, bb.min.y, (bb.min.z + bb.max.z) / 2};
+    e.fix = MatrixMultiply(MatrixMultiply(MatrixTranslate(-c.x, -c.y, -c.z), MatrixScale(sc, sc, sc)), MatrixRotateY(yaw));
     e.ok = true;
     TraceLog(LOG_INFO, "Modelo externo carregado: %s (%d animacoes)", path.c_str(), e.animCount);
     return e;
@@ -480,7 +487,7 @@ static void drawCar(const Car& c, float t, float night) {
     Vector3 b = {c.pos.x, 0, c.pos.z};
     float L = 4.6f, W = 1.84f;
     Color body = c.police ? Color{235, 235, 240, 255} : c.col;
-    Ext* ex = (c.police && extPolice.ok) ? &extPolice : (!c.police && !extCars.empty()) ? &extCars[(c.col.r + c.col.g + c.type) % extCars.size()] : nullptr;
+    Ext* ex = (c.police && extPolice.ok) ? &extPolice : (!c.police && !extCars.empty() && (c.col.r + c.col.b + c.type) % 5 < 3) ? &extCars[(c.col.r + c.col.g + c.type) % extCars.size()] : nullptr;
     if (ex) {
         drawExt(*ex, local(b, c.yaw, {0, 0, 0}, {1, 1, 1}), -1, 0, 0.25f);
         if (c.police) {
@@ -514,7 +521,7 @@ static void drawCar(const Car& c, float t, float night) {
 static void drawHuman(Vector3 p, float yaw, float phase, float moving, Color shirt, Color pants, Color skin, Ext* ex = nullptr, bool animate = true) {
     if (ex && ex->ok) {
         int anim = moving > 0.3f ? (ex->walk >= 0 ? ex->walk : ex->idle) : (ex->idle >= 0 ? ex->idle : -1);
-        drawExt(*ex, TRS(p, yaw, {1, 1, 1}), animate ? anim : -1, phase / 5.f, 0.6f);
+        drawExt(*ex, TRS(p, yaw, {1, 1, 1}), animate ? anim : -1, phase / 3.2f, 0.6f);
         return;
     }
     float sw = sinf(phase) * 0.55f * moving, bob = fabsf(sinf(phase)) * 0.045f * moving;
@@ -961,7 +968,7 @@ int main() {
                 if (Vector3Distance(p.pos, focusPt) > 200) continue;
                 if (p.dead) { drawM(mCube, TRS({p.pos.x, 0.3f, p.pos.z}, p.yaw, {0.5f, 0.3f, 1.7f}), p.shirt, 0, 0.8f); continue; }
                 drawHuman(p.pos, p.yaw, p.phase, 1, p.shirt, {50, 60, 80, 255}, {200, 150, 115, 255},
-                          extPeds.empty() ? nullptr : &extPeds[(&p - &peds[0]) % extPeds.size()], Vector3Distance(p.pos, focusPt) < 45);
+                          extPeds.empty() ? nullptr : &extPeds[(&p - &peds[0]) % extPeds.size()], Vector3Distance(p.pos, focusPt) < 30);
             }
             if (!inCar && screen != TITLE) drawHuman(player, pyaw, walkPhase, moving, {240, 240, 235, 255}, {40, 45, 60, 255}, {190, 140, 105, 255}, extPlayer.ok ? &extPlayer : nullptr);
         };

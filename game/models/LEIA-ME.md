@@ -22,3 +22,8 @@ O GitHub Actions empacota esta pasta junto com o `NeonCoast.exe`.
 - **Fab** (fab.com) e **CGTrader** (filtro "free"): exporte/converta para .glb.
 
 Não use modelos extraídos de jogos comerciais (GTA, etc.): são protegidos por direitos autorais.
+
+## Personagens do Mixamo / Ready Player Me
+O build roda `tools/fix_skin.py` em todos os .glb (ajusta o esqueleto para a raylib).
+Para dar animações de andar a um personagem que não tem, use:
+`python game/tools/copy_anims.py personagem_com_walk.glb seu_personagem.glb Walk Idle`
